@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import shlex
@@ -1857,3 +1858,86 @@ class TestSingleMuonExperimentScript:
             text=True,
         )
         assert result.returncode == 2 and "Switches must be 0 or 1" in result.stderr
+
+
+class TestMuonLogAnalysis:
+    """Log analysis must exclude warmup and pair cases within a repeat."""
+
+    @staticmethod
+    def _line(name, mean, trial=None, status=None):
+        command = ""
+        if trial is not None:
+            command = f"/env/bin/python -m torch.distributed.run /src/tasks/train_muon_step.py --case {name} --trial {trial}\n"
+        if status is None:
+            status = "executed" if "overlap1" in name else "disabled"
+        return command + f"[default0]:2026-10-23 INFO {name}: {mean:.3f} ms, overlap={status}\n"
+
+    @staticmethod
+    def _run(log, *args):
+        script = Path(__file__).resolve().parents[2] / "scripts" / "analyze_muon_step_log.sh"
+        return subprocess.run(
+            ["bash", str(script), str(log), *args],
+            env={**os.environ, "PYTHON": sys.executable},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_full_first_repeat_excludes_warmup_and_later_repeat(self, tmp_path):
+        lines = ["[default0]:INFO Warmup 40: mean 9999.000 ms, stable windows 3/3\n"]
+        for scenario in ("fsdp", "hsdp"):
+            for dedup in (1,) if scenario == "fsdp" else (1, 0):
+                for overlap in (0, 1):
+                    for momentum in ("legacy", "vanilla"):
+                        name = f"{scenario}_dedup{dedup}_overlap{overlap}_{momentum}"
+                        lines.append(self._line(name, 10 / (1 + overlap), trial=0))
+        lines.append(self._line("fsdp_dedup1_overlap0_legacy", 999, trial=1))
+        log = tmp_path / "node0.log"
+        log.write_text("".join(lines))
+        output = self._run(log).stdout
+        with (tmp_path / "node0-analysis-r00" / "summary.csv").open() as handle:
+            rows = list(csv.DictReader(handle))
+        with (tmp_path / "node0-analysis-r00" / "ablations.csv").open() as handle:
+            effects = list(csv.DictReader(handle))
+        assert len(rows) == 12 and len(effects) == 16
+        assert "12/12" in output and "999.000" not in output and "9999.000" not in output
+        assert all(float(effect["speedup"]) == 2 for effect in effects if effect["factor"] == "overlap")
+        assert all(float(effect["latency_reduction_pct"]) == 50 for effect in effects if effect["factor"] == "overlap")
+
+    def test_result_only_log_infers_repeat_per_case(self, tmp_path):
+        log = tmp_path / "node0.log"
+        first = "fsdp_dedup1_overlap0_legacy"
+        second = "fsdp_dedup1_overlap1_legacy"
+        log.write_text(self._line(first, 10) + self._line(second, 5) + self._line(second, 4) + self._line(first, 8))
+        output = self._run(log, "--trial", "1", "--cases", first, second).stdout
+        assert "2/2" in output and "2.000x" in output
+        assert "按各配置出现次数推断轮次" in output
+        assert (tmp_path / "node0-analysis-r01" / "report.md").exists()
+
+    def test_partial_log_reports_fallback_and_unfinished_cases(self, tmp_path):
+        log = tmp_path / "node0.log"
+        name = "hsdp_dedup1_overlap1_vanilla"
+        log.write_text(self._line(name, 12, trial=0, status="expected_fallback_replicate_dedup"))
+        output = self._run(log, "--scenario", "hsdp").stdout
+        assert "1/8" in output and "不代表有效 overlap 的收益" in output
+        assert "本轮尚未看到结果行" in output
+
+    def test_incomplete_last_line_is_not_a_result(self, tmp_path):
+        log = tmp_path / "node0.log"
+        name = "fsdp_dedup1_overlap0_legacy"
+        log.write_text(self._line(name, 10, trial=0).rstrip("\n"))
+        output = self._run(log, "--cases", name).stdout
+        assert "0/1" in output and "尚无换行" in output
+
+    def test_duplicate_and_ansi_lines_keep_last_value(self, tmp_path):
+        log = tmp_path / "node0.log"
+        name = "fsdp_dedup1_overlap0_legacy"
+        log.write_text("\x1b[32m" + self._line(name, 10, trial=0) + "\x1b[0m" + self._line(name, 8, trial=0))
+        output = self._run(log, "--cases", name).stdout
+        assert "1/1" in output and "8.000" in output and "保留最后一条" in output
+
+    def test_unknown_log_format_is_diagnosed(self, tmp_path):
+        log = tmp_path / "node0.log"
+        log.write_text("INFO Warmup 50: mean 100 ms\n")
+        output = self._run(log).stdout
+        assert "0/12" in output and "没有匹配的性能结果" in output

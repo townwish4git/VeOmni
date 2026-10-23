@@ -1,5 +1,19 @@
 # GPU Muon ST validation
 
+## Offline node0.log analysis
+
+Six hardware-independent checks passed locally for the standalone log analyzer:
+12 cases yield 16 matched single-factor comparisons; warmup and later repeats
+are excluded; commandless logs infer rounds independently per case; incomplete
+cases and overlap fallback remain visible; a line still being written is skipped;
+ANSI/duplicate lines keep the last result with a warning; and unknown formats
+produce an explicit diagnostic. The checks execute only the new test class from
+`tests/optim/test_muon_unit.py` via AST extraction because the local interpreter
+has no Torch. Bash syntax, ruff, `make quality` and documentation-path checks also
+passed. No server or accelerator validation was run. Actual user log files have
+not yet been provided; the parser targets the current training entry's final
+result-line and launcher-command formats.
+
 ## Current matrix coordinator and eight-rank configuration
 
 The matrix entry supports one-machine SSH coordination through HOSTS. It passes

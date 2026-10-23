@@ -293,6 +293,56 @@ skips profiling. Common environment overrides include `REPEATS`, `WARMUP_MIN`,
 `OUTPUT_DIR`. Equivalent CLI flags are accepted; `--cases` selects names shown by
 the dry run. Additional trace flags: `--record-shapes --profile-memory --with-stack`.
 
+## Analyze node0.log before the suite finishes
+
+The standalone log analyzer needs only Python's standard library. It reads a
+snapshot of the current log, prints a Chinese Markdown report, and saves CSVs:
+
+```bash
+bash VeOmni/scripts/analyze_muon_step_log.sh \
+  /path/to/muon_step_results/<RUN_ID>/coordinator/node0.log
+```
+
+By default it analyzes only the first repeat (`--trial 0`). Reports are saved
+beside the log in `node0-analysis-r00/report.md`, `summary.csv`, and `ablations.csv`.
+Repeat the command to refresh the report while training continues. The analyzer
+never launches training, reads result.json or traces, modifies the input log,
+or changes Python paths. It uses the caller's PYTHON or otherwise python3.
+
+Options:
+
+```bash
+# HSDP only; customize where the analysis files are written.
+bash VeOmni/scripts/analyze_muon_step_log.sh /path/to/node0.log \
+  --scenario hsdp --output /path/to/analysis-first-round
+# Second repeat (indices start at zero).
+bash VeOmni/scripts/analyze_muon_step_log.sh /path/to/node0.log --trial 1
+# If the suite ran selected cases, specify their names for accurate completion counts.
+bash VeOmni/scripts/analyze_muon_step_log.sh /path/to/node0.log \
+  --cases fsdp_dedup1_overlap0_legacy fsdp_dedup1_overlap1_legacy
+```
+
+The parser recognizes final rank0 result lines such as
+`hsdp_dedup0_overlap1_vanilla: 12.345 ms, overlap=executed`, excluding warmup
+means. It associates them with the preceding torchrun command's `--case` and
+`--trial`; commandless logs use each case's occurrence count and emit a warning
+because truncated or concatenated logs can make that inference ambiguous.
+ANSI colors and torchrun prefixes are supported. Duplicate case/trial results
+keep the last logged value with a warning. A last line without a newline is
+skipped because it may still be in progress. Other formats are diagnosed rather
+than silently interpreted as benchmark results.
+
+The report shows per-scenario rankings, baseline speedups and latency reductions,
+and matched single-factor comparisons, including both cases' actual overlap
+status in CSV. Baselines are dedup on + overlap off + legacy within the selected
+repeat and scenario. Missing results remain listed; no requirement to finish
+all cases or all repeats. Negative reductions indicate regressions. Overlap
+fallback is flagged so the switch's effect is not attributed to an executed
+pipeline. Case names provide the pairing: logs cannot verify workload inventories,
+model configurations, topology or source versions. Only logged means are used
+(to their printed precision); P95, CV and memory cannot be recovered from these
+lines. One repeat provides preliminary observations, not repeatability evidence.
+
 ## Artifacts
 
 ```text
