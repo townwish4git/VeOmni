@@ -16,6 +16,11 @@
 
 from __future__ import annotations
 
+import json
+import os
+import shlex
+import subprocess
+import sys
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
@@ -1311,3 +1316,136 @@ class TestGramQuackFallback:
         monkeypatch.setattr(muon_mod, "get_gpu_compute_capability", lambda _device: 90)
         grad = type("FakeTensor", (), {"device": torch.device(device_type)})()
         assert muon_mod._gram_quack_unavailable_reason(grad) is None
+
+
+class TestMuonBashLaunch:
+    """Keep the experiment launch path in Bash, directly targeting torchrun."""
+
+    @staticmethod
+    def _environment(tmp_path):
+        root = Path(__file__).resolve().parents[2]
+        return {
+            **os.environ,
+            "VEOMNI_ROOT": str(root),
+            "HYPER_ROOT": str(tmp_path),
+            "PYTHON": sys.executable,
+            "TORCHRUN": "/usr/bin/true",
+            "OUTPUT_DIR": str(tmp_path / "results"),
+            "NNODES": "1",
+            "NODE_RANK": "0",
+            "NPROC_PER_NODE": "16",
+            "HOSTS": "",
+            "RUN_ID": "unit",
+            "SCENARIO": "all",
+            "DEVICE": "npu",
+            "REPEATS": "3",
+            "SEED": "42",
+            "MASTER_PORT": "29540",
+            "HCCL_BASE_PORT": "40000",
+            "MODEL_CONFIG": str(tmp_path / "model"),
+            "SNAPSHOT_ROOT": "",
+        }
+
+    def test_factorial_dry_run_targets_training_script_directly(self, tmp_path):
+        environment = self._environment(tmp_path)
+        script = Path(environment["VEOMNI_ROOT"]) / "scripts/run_muon_step_st.sh"
+        result = subprocess.run(
+            ["bash", str(script), "--dry-run"], env=environment, check=True, capture_output=True, text=True
+        )
+        commands = [shlex.split(line) for line in result.stdout.splitlines()]
+        assert len(commands) == 36
+        assert len({command[1] for command in commands}) == 36
+        cases = [command[command.index("--case") + 1] for command in commands]
+        assert sum(case.startswith("fsdp_") for case in cases) == 12
+        assert sum(case.startswith("hsdp_") for case in cases) == 24
+        for command in commands:
+            assert command[:1] == ["env"]
+            assert command[2] == "/usr/bin/true"
+            assert str(Path(environment["VEOMNI_ROOT"]) / "tasks/train_muon_step.py") in command
+            assert "scripts.muon_step_benchmark.run" not in " ".join(command)
+        assert not (tmp_path / "results").exists()
+
+    def test_manual_nodes_share_order_and_ports(self, tmp_path):
+        environment = {**self._environment(tmp_path), "NNODES": "2", "NPROC_PER_NODE": "8"}
+        script = Path(environment["VEOMNI_ROOT"]) / "scripts/run_muon_step_st.sh"
+        plans = []
+        for rank in ("0", "1"):
+            result = subprocess.run(
+                ["bash", str(script), "--dry-run"],
+                env={**environment, "NODE_RANK": rank},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            plans.append([shlex.split(line) for line in result.stdout.splitlines()])
+        for first, second in zip(*plans):
+            assert [part for part in first if not part.startswith("--node-rank=")] == [
+                part for part in second if not part.startswith("--node-rank=")
+            ]
+
+    def test_summarize_only_does_not_resolve_or_run_torchrun(self, tmp_path):
+        environment = self._environment(tmp_path)
+        environment["TORCHRUN"] = str(tmp_path / "missing-torchrun")
+        case = Path(environment["OUTPUT_DIR"]) / "unit/r00_fsdp_dedup1_overlap0_legacy"
+        case.mkdir(parents=True)
+        (case / "result.json").write_text(
+            json.dumps(
+                {
+                    "case": "fsdp_dedup1_overlap0_legacy",
+                    "scenario": "fsdp",
+                    "trial": 0,
+                    "dedup": True,
+                    "overlap": False,
+                    "momentum": "legacy",
+                    "source": "unit",
+                    "timing": {"slowest_rank_per_step": {"mean_ms": 1.0}},
+                    "ranks": [{"peak_allocated_bytes": 0, "pipeline_buckets": 0}],
+                    "environment": {"fsdp_backend": "hyper"},
+                }
+            )
+        )
+        script = Path(environment["VEOMNI_ROOT"]) / "scripts/run_muon_step_st.sh"
+        subprocess.run(
+            ["bash", str(script), "--summarize-only"], env=environment, check=True, capture_output=True, text=True
+        )
+        assert (case.parent / "summary.csv").is_file()
+
+    def test_dummy_iteration_preserves_gradients_and_skips_other_updates(self, monkeypatch):
+        pytest.importorskip("hyper_parallel")
+        from tasks.train_muon_step import MuonStepTrainer
+
+        parameter = nn.Parameter(torch.ones(2, 2))
+        parameter.grad = torch.full_like(parameter, 0.25)
+        original_gradient = parameter.grad
+        trainer = MuonStepTrainer.__new__(MuonStepTrainer)
+        calls = []
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("A non-Muon training operation executed")
+
+        trainer.model = SimpleNamespace(forward=forbidden)
+        trainer.optimizer = SimpleNamespace(step=forbidden, zero_grad=forbidden)
+        trainer.muon = SimpleNamespace(step=lambda: calls.append("muon"))
+        monkeypatch.setattr(torch.autograd, "backward", forbidden)
+        trainer.step()
+        assert calls == ["muon"]
+        assert parameter.grad is original_gradient
+        torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 0.25))
+
+    def test_no_python_process_is_needed_before_torchrun(self, tmp_path):
+        environment = self._environment(tmp_path)
+        executable = tmp_path / "torchrun"
+        captured = tmp_path / "called.args"
+        executable.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$CAPTURE_ARGS"\nexit 77\n')
+        executable.chmod(0o755)
+        environment.update({"TORCHRUN": str(executable), "PYTHON": "/bin/false", "CAPTURE_ARGS": str(captured)})
+        script = Path(environment["VEOMNI_ROOT"]) / "scripts/run_muon_step_st.sh"
+        result = subprocess.run(
+            ["bash", str(script), "--repeats", "1", "--cases", "fsdp_dedup1_overlap0_legacy"],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 77, result.stderr
+        assert "/tasks/train_muon_step.py" in captured.read_text()

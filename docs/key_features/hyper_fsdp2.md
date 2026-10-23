@@ -98,7 +98,10 @@ These options require Hyper Muon. Overlap eligibility depends on the layout and
 callbacks; HSDP replicate dedup currently prevents the single-axis pipeline.
 
 The standalone [Muon step ST](../../scripts/muon_step_benchmark/README.md)
-provides a movable Bash entry, full FSDP/HSDP ablations, stability warmup,
+provides a movable Bash entry that calls `torchrun tasks/train_muon_step.py`
+directly. The training replacement retains VeOmni model/shard/optimizer
+construction and makes non-Muon training stages dummy. It supports source-only
+imports, full FSDP/HSDP ablations, stability warmup,
 unprofiled latency samples, a subsequent profiling window, multi-node launch,
 and optional input capture from a real training first step.
 

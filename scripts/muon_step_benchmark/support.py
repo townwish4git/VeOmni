@@ -12,47 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Hardware-independent ablation planning and timing statistics."""
+"""Timing statistics and shard geometry for the dummy Muon training entry."""
 
 import math
 import statistics
-from dataclasses import asdict, dataclass
-from itertools import product
-from typing import Any, Sequence
-
-
-@dataclass(frozen=True)
-class Experiment:
-    """One requested Muon configuration; effective eligibility is measured separately."""
-
-    scenario: str
-    dedup: bool
-    overlap: bool
-    momentum: str
-
-    @property
-    def name(self) -> str:
-        """Return a stable identifier shared by every torchrun node."""
-        return f"{self.scenario}_dedup{int(self.dedup)}_overlap{int(self.overlap)}_{self.momentum}"
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return the configuration with its stable identifier."""
-        return {"name": self.name, **asdict(self)}
-
-
-def experiments(scenario: str) -> list[Experiment]:
-    """Enumerate all four FSDP and all eight HSDP factor combinations."""
-    if scenario not in ("all", "fsdp", "hsdp"):
-        raise ValueError(f"Unknown scenario: {scenario}")
-    result = []
-    for topology in ("fsdp", "hsdp"):
-        if scenario not in ("all", topology):
-            continue
-        for dedup, overlap, momentum in product(
-            (True,) if topology == "fsdp" else (True, False), (False, True), ("legacy", "vanilla")
-        ):
-            result.append(Experiment(topology, dedup, overlap, momentum))
-    return result
+from typing import Sequence
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:

@@ -110,7 +110,7 @@ def _dtensor(local, shape, stride, mesh, placements, backend):
 
 def _source_configs(args) -> tuple[dict, Any]:
     name = "qwen3_muon_2k_16.yaml" if args.scenario == "fsdp" else "qwen3_muon_128k_hsdp_16.yaml"
-    path = args.veomni_root / "configs" / "hyperparallel" / name
+    path = getattr(args, "config", None) or args.veomni_root / "configs" / "hyperparallel" / name
     raw = path.read_text()
     config = yaml.safe_load(raw)
     accelerator = config["model"]["accelerator"]
@@ -216,11 +216,10 @@ def _make_synthetic(args, api, mesh, device):
             "config_resolved": asdict(opt_config),
         }
     )
-    del model, params
-    return inventory, opt_config, source
+    return model, inventory, opt_config, source
 
 
-def _materialize(inventory, mesh, device, seed, backend, captured=None):
+def _materialize(inventory, mesh, device, seed, backend, captured=None, model=None):
     replicate, shard = (HyperReplicate, HyperShard) if backend == "hyper" else (TorchReplicate, TorchShard)
     placements = (replicate(), shard(0)) if mesh.ndim == 2 else (shard(0),)
     named = []
@@ -258,7 +257,14 @@ def _materialize(inventory, mesh, device, seed, backend, captured=None):
         if grad is not None:
             param.grad = _dtensor(grad, shape, stride, mesh, current_placements, backend)
         named.append((entry["name"], param))
-    model = ReplayModel(named)
+    if model is None:
+        model = ReplayModel(named)
+    else:
+        # Dummy forward never enters FSDP hooks. Install the real Muon inputs
+        # under their original FQNs, leaving unrelated parameters on meta.
+        for name, param in named:
+            parent, _, leaf = name.rpartition(".")
+            model.get_submodule(parent).register_parameter(leaf, param)
     model._veomni_fsdp_backend = backend
     return model
 
@@ -302,14 +308,21 @@ def _build_optimizer(model, args, api, opt_config):
         raise ValueError(f"Feature injection was not effective: {effective} vs {requested}")
     if len(leaf.param_groups) != 1:
         raise ValueError("Expected VeOmni's single Muon parameter group")
-    if [id(param) for param in model.parameters()] != [id(param) for param in leaf.param_groups[0]["params"]]:
+    expected = (
+        list(model.parameters())
+        if api is None
+        else api["muon"].split_muon_adamw_params(
+            model, no_decay_modules=opt_config.no_decay_modules, no_decay_params=opt_config.no_decay_params
+        )[0]
+    )
+    if [id(param) for param in expected] != [id(param) for param in leaf.param_groups[0]["params"]]:
         raise ValueError("VeOmni changed the replay parameter inventory or ordering")
     return chain, leaf, effective
 
 
 def build_workload(args: Any, mesh: Any, device: torch.device) -> tuple[Any, Any, dict[str, Any]]:
     """Construct actual VeOmni Muon shards, or a clearly labelled tiny control workload."""
-    api, captured, opt_config = None, None, None
+    api, captured, opt_config, model = None, None, None, None
     tiny_control = args.smoke and args.model_config is None and args.snapshot_root is None
     if args.fsdp_backend == "hyper":
         adapter = importlib.import_module("veomni.distributed.hyper_fsdp2") if not tiny_control else None
@@ -371,16 +384,18 @@ def build_workload(args: Any, mesh: Any, device: torch.device) -> tuple[Any, Any
                 if manifest["optimizer_group"].get(key) != value:
                     raise ValueError(f"Snapshot optimizer {key} differs from source YAML")
         else:
-            inventory, opt_config, source = _make_synthetic(args, api, mesh, device)
-            source["kind"] = "veomni_meta_wrapped_inventory_fixed_synthetic_gradients"
+            model, inventory, opt_config, source = _make_synthetic(args, api, mesh, device)
+            source["kind"] = "veomni_dummy_training_fixed_synthetic_gradients"
         source["veomni"] = git_metadata(args.veomni_root)
-    model = _materialize(inventory, mesh, device, args.seed, args.fsdp_backend, captured)
+    model = _materialize(inventory, mesh, device, args.seed, args.fsdp_backend, captured, model)
     chain, leaf, effective = _build_optimizer(model, args, api, opt_config)
     source.update(
         {
             "inventory": inventory,
             "inventory_sha256": hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest(),
             "effective": effective,
+            "retained_model_class": f"{type(model).__module__}.{type(model).__qualname__}",
+            "dummy_non_muon_parameter_count": sum(1 for _ in model.parameters()) - len(inventory),
             "optimizer_groups": [
                 {key: value for key, value in group.items() if key != "params"} for group in leaf.param_groups
             ],
@@ -390,7 +405,7 @@ def build_workload(args: Any, mesh: Any, device: torch.device) -> tuple[Any, Any
             "global_muon_numel": sum(math.prod(entry["shape"]) for entry in inventory),
             "hyper_parallel": git_metadata(Path(hyper_parallel.__file__).resolve().parent.parent),
             "hyper_parallel_import": hyper_parallel.__file__,
-            "scope": "leaf Muon.step only; fixed post-reduction/post-clip gradients; no AdamW, fwd, bwd or clipping",
+            "scope": "dummy training iteration; fixed gradients; real VeOmni model scaffold and HP Muon; other stages dummy",
         }
     )
     return chain, leaf, source

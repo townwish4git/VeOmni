@@ -1,81 +1,113 @@
-# VeOmni / HyperParallel Muon step ST
+# VeOmni dummy training / HyperParallel Muon ST
 
-This is an optimizer latency and profiling experiment, derived from
-`configs/hyperparallel/qwen3_muon_2k_16.yaml` (FSDP 16) and
-`configs/hyperparallel/qwen3_muon_128k_hsdp_16.yaml` (HSDP replicate 2 × shard 8).
-It measures the **leaf HyperParallel `Muon.step()`**, including host dispatch,
-communication, momentum, Newton–Schulz, parameter updates and device completion.
-It excludes AdamW, gradient clipping, scheduler, data loading, forward and backward.
-The result is optimizer-step speedup; it is not full-training speedup or a numerical/convergence test.
+Launch path:
 
-## Directory and environment
+```text
+run_muon_step_st.sh
+  └─ torchrun ... tasks/train_muon_step.py <original-training.yaml>
+       └─ MuonStepTrainer: real VeOmni construction + dummy training stages
+```
 
-Use the same accelerator environment as real VeOmni training (Python 3.11/3.12,
-VeOmni dependencies, transformers 5.16.1, matching Torch/torch_npu/CANN or CUDA).
-The benchmark does not install or replace your accelerator stack.
+Bash owns the experiment matrix, repeats, case ordering and distributed launch.
+There is no Python experiment launcher. After training jobs finish, Bash invokes
+`report.py` to summarize their existing result files; that module launches no jobs.
+
+## Training replacement
+
+`tasks/train_muon_step.py` follows `tasks/train_text.py`'s model/optimizer build
+boundaries through VeOmni's `build_foundation_model`, `build_parallelize_model`
+and `build_optimizer`. It reads the original FSDP/HSDP training YAML.
+
+The default path retains the actual wrapped Qwen3/Qwen3-MoE module tree. It builds
+on meta, bypasses checkpoint loading, classifies parameters using VeOmni's own
+Muon/AdamW split, and materializes Muon local shards at their original model FQNs.
+Non-Muon parameters remain on meta, and AdamW state is never allocated.
+Hyper DTensor is the default; `FSDP_BACKEND=torch` selects Torch DTensor while
+retaining Hyper Muon. The supported layout is Shard(0), optionally with an HSDP
+replicate axis; EP/TP/PP/CP/SP and CPU offload are disabled as in the source YAMLs.
+
+Each `MuonStepTrainer.step()` runs:
+
+```text
+forward()             dummy: returns None; no model/FSDP forward hooks
+backward(loss)        dummy: keeps preinitialized reduced gradients
+clip_grad_norm()      dummy: gradients represent post-clip inputs
+muon.step()           REAL: momentum, NS, collectives and parameter update
+adamw_step()          dummy
+scheduler_step()      dummy: constant source LR
+zero_grad()           dummy: preserves gradients for the next iteration
+```
+
+Dataset/tokenizer loading, checkpoint I/O and activation allocation are omitted.
+Initial Muon weights and gradients are deterministic nonzero normal values;
+replicate peers receive identical local shards. Weights and momentum evolve,
+while gradients stay fixed across iterations. All model Muon tensors, including
+3D experts, have gradients in this mode. Optional first-step snapshot replay
+preserves real input values and missing-gradient masks instead.
+
+This preserves Muon shapes, grouping, layout, dtypes, settings and computation;
+it does not reproduce training gradient distributions, activation memory pressure
+or convergence. Timings cover the dummy training iteration and all-stream device
+completion, with Muon as the only real training stage. They are optimizer latency
+results, not full-training speedups. The 2K/128K sequence lengths affect real
+forward/backward but do not change this dummy iteration's work.
+
+## Source-only setup
+
+Use an existing VeOmni training environment with its dependencies, matching
+Torch/torch_npu/CANN or CUDA, Python 3.11/3.12 and transformers 5.16.1.
+The two project checkouts themselves do **not** need pip installation.
 
 ```text
 experiment/
-  hyper-parallel/       # current Muon implementation, all three features present
-  VeOmni/               # this branch
-  run_muon_step_st.sh    # copy VeOmni/scripts/run_muon_step_st.sh here
-  muon_step_results/     # created automatically
+  hyper-parallel/
+  VeOmni/                # this branch
+  run_muon_step_st.sh     # copy VeOmni/scripts/run_muon_step_st.sh here
 ```
 
-In the active environment on **each node**, install both checkouts as editables:
+The Bash entry automatically exports both source roots in `PYTHONPATH` and sets
+`PYTHON_EXEC` so torchrun workers use `PYTHON`. Worker import-path checks ensure
+that those source directories supply the packages. `PYTHON` defaults to python3;
+`TORCHRUN` uses its sibling executable if present, otherwise torchrun from PATH.
+Activate the training environment first, or provide both executable paths.
 
-```bash
-python -m pip install --no-deps -e ./hyper-parallel -e ./VeOmni
-python -c 'import hyper_parallel, veomni; print(hyper_parallel.__file__, veomni.__file__)'
-```
-
-`MODEL_CONFIG` must point to the **same Qwen3 model's local HF directory** used
-for training (a directory containing `config.json`; a config file is also accepted
-by the VeOmni loader). The supplied YAMLs contain placeholder checkpoint paths,
-so the harness cannot infer which model size you trained. No checkpoint weights,
-tokenizer or dataset are needed in the default extraction mode.
-
-## One machine with 16 devices
+## One machine, 16 devices
 
 From `experiment/`:
 
 ```bash
+cp VeOmni/scripts/run_muon_step_st.sh .
 MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh
 ```
 
-Preview the full matrix and commands without importing Torch or launching jobs:
+`MODEL_CONFIG` is the **same actual model's local HF config directory** as real
+training. The YAMLs contain placeholder model paths, so it must be supplied.
+No weights, tokenizer or dataset are read. Paths to a local config.json are also
+accepted by the VeOmni loader.
 
 ```bash
+# Print all direct torchrun commands without starting Python or training jobs.
 MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh --dry-run
+
+# Select one topology; use DEVICE=cuda for NVIDIA.
+SCENARIO=hsdp MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh
 ```
 
-The default is NPU, Hyper FSDP backend, 3 repeats, warmup 20–200 steps,
-50 unprofiled measurement steps, then 2 profiler warmup + 5 active steps,
-all ranks profiled. Cases execute in a deterministic randomized order per repeat.
-Each case/repeat starts a fresh torchrun job and fresh optimizer state.
-Select CUDA using `DEVICE=cuda`. Select one topology using `SCENARIO=fsdp` or `hsdp`.
-Use `--cases ...` with names printed by the dry run to select individual cases.
-
-## Two machines with 8 devices each
-
-For SSH one-command launch, both machines need the same absolute repository,
-model/config, environment/interpreter and output paths. The coordinator needs
-passwordless SSH plus `rsync`, and `MASTER_ADDR` must be reachable by both nodes.
-SSH shells must have the normal CANN/CUDA runtime environment configured.
+A single case can also be launched directly, without the suite Bash script:
 
 ```bash
-MODEL_CONFIG=/models/Qwen3-30B-A3B \
-NPROC_PER_NODE=8 HOSTS=node0,node1 MASTER_ADDR=10.0.0.10 \
-PYTHON=/path/to/training/env/bin/python \
-bash run_muon_step_st.sh
+export PYTHONPATH="$PWD/hyper-parallel:$PWD/VeOmni${PYTHONPATH:+:$PYTHONPATH}"
+torchrun --nproc-per-node=16 VeOmni/tasks/train_muon_step.py \
+  VeOmni/configs/hyperparallel/qwen3_muon_128k_hsdp_16.yaml \
+  --model-config /models/Qwen3-30B-A3B --output ./one-case \
+  --case hsdp_dedup0_overlap1_vanilla --scenario hsdp \
+  --dedup 0 --overlap 1 --momentum vanilla
 ```
 
-The script SSH-launches both nodes, waits for completion, retrieves each node's
-rank artifacts/profiles with rsync, and writes the combined summary locally.
-Retrieval errors are printed with the remote path; raw data remains on its node.
-Do not launch a second copy of the SSH coordinator on node1.
+## Two machines, 8 devices each
 
-Alternatively run the following **on both nodes**, with `NODE_RANK=0` / `1`:
+Manual per-node launch directly enters torchrun from Bash. Run on each node
+with `NODE_RANK=0` / `1` and identical flags/RUN_ID:
 
 ```bash
 MODEL_CONFIG=/models/Qwen3-30B-A3B NNODES=2 NPROC_PER_NODE=8 \
@@ -83,178 +115,153 @@ NODE_RANK=0 MASTER_ADDR=10.0.0.10 RUN_ID=muon-ablation-001 \
 bash run_muon_step_st.sh
 ```
 
-Use identical CLI flags and RUN_ID on both nodes. In manual mode rank0 writes
-combined timing results; profiles remain on each node unless output is shared.
-Every case uses a distinct rendezvous port starting at `MASTER_PORT` (default
-29540). On NPU the launcher also assigns a distinct `HCCL_IF_BASE_PORT`, reserving
-256 ports per case starting at `HCCL_BASE_PORT` (default 40000), recorded in the
-plan and worker environment. Both nodes must use the same bases. Choose different
-bases when running another suite concurrently; rendezvous ports alone do not
-isolate HCCL. The launcher rejects port ranges extending beyond 65535.
+For one-command SSH launch from the coordinator:
 
-## What is extracted
+```bash
+MODEL_CONFIG=/models/Qwen3-30B-A3B HOSTS=node0,node1 \
+NPROC_PER_NODE=8 MASTER_ADDR=10.0.0.10 \
+PYTHON=/path/to/env/bin/python TORCHRUN=/path/to/env/bin/torchrun \
+bash run_muon_step_st.sh
+```
 
-The harness builds the requested model through VeOmni's registry on `meta`,
-runs the actual VeOmni FSDP2 wrap, and calls its Muon/AdamW classifier **after
-wrapping**. Only the materialize/load routine is bypassed during this pass.
-It extracts Muon FQNs/order, global shape/stride, FP32 optimizer dtype and shard
-placements, then allocates only those local parameter and gradient shards.
-Reconstruction uses Hyper DTensor by default, including the 2D HSDP mesh;
-`FSDP_BACKEND=torch` explicitly selects Torch DTensor while retaining HP Muon.
-EP/TP/PP/CP/SP and CPU offload must be disabled as in the supplied configurations.
+`HOSTS` contains SSH names/IPs/aliases, first node rank 0. Both nodes need the
+same absolute paths and dependencies; the coordinator needs passwordless SSH
+and rsync. Each SSH child runs the **Bash script**, which sets source paths
+locally and directly calls torchrun. Thus source-only imports also work remotely.
+The SSH shells must supply their normal CANN/CUDA runtime environment.
 
-The two source YAMLs default to `fsdp_backend: torch`, and the FSDP YAML also
-has `use_hyper_optimizer: false`. This experiment intentionally overrides those
-selections to `hyper` / `true`, records both source YAML and effective selections,
-and preserves NS coefficients (custom, 5 iterations), momentum coefficient,
-Nesterov, RMS scaling, LR and weight decay through the VeOmni optimizer factory.
-Attention/MLP kernels use eager only during meta inventory construction; no
-forward kernel executes in the measured workload.
+After jobs finish, profiles are copied back with rsync and results summarized.
+In manual mode rank0 summarizes combined timing results, while profiles stay on
+each rank's node unless output storage is shared. Rebuild summaries after copying:
 
-Default weights and gradients are deterministic nonzero normal values, seeded
-by original parameter order and shard coordinate. Replicate peers receive the
-same shard. Inputs and initial states match across ablations; each step reuses
-the fixed post-reduction/post-clip gradient, evolving weights and momentum.
-All model Muon parameters, including MoE experts, have a gradient in this mode.
-This preserves compute/communication shape and volume, not training gradient
-values, sparsity, evolving gradient distributions or activation memory pressure.
-Sequence length (2K vs 128K) affects full training but not this isolated step.
+```bash
+RUN_ID=muon-ablation-001 bash run_muon_step_st.sh --summarize-only
+```
 
-## Factorial ablations
+Rendezvous ports start at `MASTER_PORT=29540`, one per case. NPU cases use distinct
+`HCCL_IF_BASE_PORT` ranges starting at `HCCL_BASE_PORT=40000`, 256 ports per case.
+Both nodes use identical bases; independent suites need different ranges.
+Port ranges are validated against 65535. Case order is deterministically shuffled
+per repeat by Bash; both nodes obtain identical order and ports.
+
+## Factorial experiments
 
 | Scenario | Dedup | Overlap | Momentum | Cases |
 | --- | --- | --- | --- | --- |
 | FSDP 16 | on (no replicate axis) | off/on | legacy/vanilla | 4 |
 | HSDP 2×8 | on/off | off/on | legacy/vanilla | 8 |
 
-Baseline within each topology/repeat is dedup on + overlap off + legacy.
-This permits single-factor comparisons with other factors held fixed, plus
-all combinations and interactions. Vanilla changes the momentum formula;
-performance comparison does not establish numerical equivalence to legacy.
-`ablations.csv` reports every available matched before/after pair with other
-factors fixed, including dedup on→off, overlap off→on and legacy→vanilla.
-Speedup is before/after; latency reduction is (1 − after/before) × 100%.
+Default 3 repeats produce 36 independent torchrun jobs. Baseline within each
+topology/repeat is dedup on + overlap off + legacy. `summary.csv` reports matched
+baseline speedups; `ablations.csv` compares one factor at a time with the other
+factors held fixed (16 matched pairs per complete repeat). Vanilla changes the
+momentum formula; these runs do not establish numerical equivalence to legacy.
 
-Current HP overlap requires a single shard axis with no replicate work assignment
-and native NS/momentum callbacks. HSDP dedup on + overlap on therefore falls back;
-those two cases remain as negative controls. HSDP dedup off exposes the FSDP
-pipeline path. A preflight counts actual pipeline bucket execution and records
-eligibility and bucket/memory plans; timing has no instrumentation patches. `overlap_status` distinguishes
-execution, disabled, expected dedup fallback and unexpected fallback.
+The source YAMLs default to Torch FSDP, and the FSDP YAML disables Hyper Muon.
+The ST intentionally selects `fsdp_backend=hyper` and `use_hyper_optimizer=true`,
+records source and effective settings, and preserves NS coefficients/steps,
+Nesterov, RMS scaling, LR, weight decay and parameter grouping through VeOmni.
+Eager ops are bound during meta construction only; model forward never executes.
 
-`BUDGET_MIB=512` sets the same explicit temporary budget for **serial and overlap**
-for a fair bucket comparison. This is an optimizer estimate, not a hard HBM cap.
-Large expert matrices may exceed the budget and use the serial oversized path.
-Inspect preflight bucket counts and workload inventory; repeat with a larger
-identical budget across every case if you want a budget sweep.
+Current HP overlap requires native callbacks and a single shard assignment
+without replicate dedup. HSDP dedup-on + overlap-on are expected fallback controls.
+A single bucket or insufficient budget can also cause fallback. Preflight records
+actual pipeline bucket execution, eligibility and memory plans, so requested
+flags are never mistaken for actual overlap execution. Timed code has no patches.
+`BUDGET_MIB=512` applies the same explicit budget to serial and overlap paths;
+this is an optimizer estimate, not a hard HBM limit. Inspect oversized fallback
+before interpreting a budget sweep.
 
-## Windows and metrics
+## Warmup, timing and profiling windows
 
-1. Untimed preflight initializes optimizer state and checks pipeline execution.
-2. Warmup continues until two adjacent 10-step windows each have CV ≤ 5% and
-   median drift ≤ 3%, repeated for 3 consecutive checks (minimum 40 steps by
-   default). Slowest-rank timings drive the same stop decision on every rank.
-   If 200 steps do not stabilize, the case fails and writes `warmup.json`;
-   it publishes no successful performance result. Relax explicitly with
-   `--stability-cv`, `--stability-drift`, `--stable-windows` if needed.
-3. The next 50 steps have no profiler. Each sample starts after an untimed world
-   barrier/device sync, and ends after `Muon.step()` plus all-stream device sync.
-   Original per-rank samples and per-step rank maxima are preserved. Stats include
-   mean, median, p90/p95/p99, min/max, standard deviation and CV. The main summary
-   uses the mean of per-step rank maxima. `max_rank_window_ms` includes untimed
-   alignment overhead and must not be used as optimizer throughput.
-4. Only after timing JSON is flushed does the profiler start, with a separate
-   warmup and active window. Every rank continues the same number of steps even
-   if `--profile-ranks 0,8` profiles selected ranks only. Trace overhead never
-   enters the latency statistics. `PROFILE_STEPS=0` disables profiling explicitly.
+Defaults:
 
-Each device step is synchronized intentionally: this measures isolated optimizer
-latency including internal communication/compute overlap, not cross-step overlap.
-Profiling follows the same synchronized step boundaries. CUDA emits Chrome JSON;
-NPU uses torch_npu Level1 and its TensorBoard handler's native trace/operator data.
+1. One preflight Muon step initializes state and records actual pipeline execution.
+2. Warmup: minimum 20, maximum 200 steps. Two adjacent 10-step windows must each
+   have CV ≤ 5% and median drift ≤ 3%, for 3 consecutive checks (earliest stop:
+   step 40). Slowest-rank timings drive identical decisions on every rank.
+   Failure to stabilize saves warmup evidence and stops the case.
+3. Measure the next 50 dummy training iterations **without profiling**. Each begins
+   after an untimed world barrier/device sync and ends after the Muon update and
+   all-stream device completion. Preserve each rank's samples and per-step rank
+   maxima; report mean/median/p90/p95/p99/min/max/std/CV and peak memory.
+4. Flush timing artifacts, then start a **separate** profiler window: 2 warmup +
+   5 active iterations. Profile all ranks by default; `--profile-ranks 0,8`
+   selects ranks while every rank still runs the same iterations. CUDA exports
+   Chrome JSON; NPU exports Level1 native traces and operator data.
 
-## Artifacts and analysis
+Step synchronization measures isolated iteration latency, including Muon's internal
+overlap. `max_rank_window_ms` includes alignment overhead and is not throughput.
+Profiler overhead does not enter latency statistics. `PROFILE_STEPS=0` explicitly
+skips profiling. Common environment overrides include `REPEATS`, `WARMUP_MIN`,
+`WARMUP_MAX`, `STABILITY_WINDOW`, `STABLE_WINDOWS`, `STABILITY_CV`, `STABILITY_DRIFT`,
+`MEASURE_STEPS`, `PROFILE_WARMUP`, `PROFILE_STEPS`, `PROFILE_RANKS`, `BUDGET_MIB` and
+`OUTPUT_DIR`. Equivalent CLI flags are accepted; `--cases` selects names shown by
+the dry run. Additional trace flags: `--record-shapes --profile-memory --with-stack`.
+
+## Artifacts
 
 ```text
 muon_step_results/<RUN_ID>/
-  plan-node<N>.json                     # exact commands and order
-  environment-node<N>.json              # package versions, driver/device probe, selected runtime settings
-  summary.csv / summary.json           # each repeat, baseline speedup, effective overlap
-  ablations.csv                        # matched single-factor pairs within each repeat
+  plan-node<N>.sh                   # exact direct torchrun invocations
+  summary.csv / summary.json        # each repeat, baseline speedup, actual overlap
+  ablations.csv                    # matched single-factor comparisons
   r00_<case>/
-    workload.json                      # inventory/hash, source YAML, effective flags, git diffs
+    environment-node<N>.json        # versions, selected runtime settings, device probe
+    workload.json                   # actual inventory, source YAML, settings, git revisions/diffs
     warmup.json
-    timing-rank00000.json              # durable before profiling starts
-    result.json                        # all ranks, statistics, peaks, environment
-    failure-rank00000.json              # if a worker fails
-    torchrun/                          # stdout/stderr per worker
-    profiles/rank00000/                 # per-rank trace
+    timing-rank00000.json           # durable before profiler creation
+    result.json                     # combined ranks, statistics, peaks, environment
+    failure-rank00000.json          # on failure
+    torchrun/                       # per-worker stdout/stderr
+    profiles/rank00000/              # per-rank traces
 ```
 
-Do not treat `--smoke` results as Qwen performance. Do not pool individual steps
-from different repeats as independent experiments. `summary.csv` preserves
-per-repeat speedups; inspect variation between repeats and compare matched
-factor settings. No outliers are trimmed. A failed profiler leaves timing files,
-but does not create a completed `result.json`.
+No outliers are trimmed. Keep repeats separate when comparing results. A profiler
+failure leaves timing files but does not publish a completed result.json.
 
-Rebuild the summary after copying node artifacts:
+## Optional actual first-step capture
 
-```bash
-bash run_muon_step_st.sh --summarize-only --run-id muon-ablation-001
-```
-
-## Optional exact first-training-step input capture
-
-For the exact weights, actual post-reduction/post-clip gradients and missing-grad
-mask of a real training step, launch the existing training task through the capture
-wrapper (same torchrun arguments on both nodes). It attaches a one-shot pre-step
-hook to HP Muon. Set the normal training overrides including local model/data,
-`model.optimizer.use_hyper_optimizer=true` and the selected FSDP backend.
+The capture wrapper is independent of the default dummy training entry. It can
+run the original training task once and capture exact post-reduction/post-clip
+Muon weights/gradients with empty momentum state:
 
 ```bash
 cd VeOmni
-python -m torch.distributed.run --nproc-per-node=16 \
-  -m scripts.muon_step_benchmark.capture --output /experiment/snapshots/fsdp \
-  --task tasks/train_text.py -- configs/hyperparallel/qwen3_muon_2k_16.yaml \
+# PYTHONPATH must include both source roots, as set by the suite Bash entry.
+torchrun --nproc-per-node=16 -m scripts.muon_step_benchmark.capture \
+  --output /experiment/snapshots/fsdp --task tasks/train_text.py -- \
+  configs/hyperparallel/qwen3_muon_2k_16.yaml \
   --model.model_path /models/Qwen3-30B-A3B --data.train_path /data/train \
   --model.accelerator.fsdp_config.fsdp_backend hyper \
   --model.optimizer.use_hyper_optimizer true --train.max_steps 1
 ```
 
-Repeat with the HSDP YAML and `--output /experiment/snapshots/hsdp`.
-Capture needs real forward/backward once, enough HBM, disk and host RAM; the 128K
-configuration may OOM before the hook. Snapshot tensors are rank-local CPU files,
-and `manifest.json` is published after every rank writes its file. Capture supports
-only empty first-step momentum state and a common Replicate/Shard(0) layout.
-It refuses to overwrite files. For multi-node capture use shared snapshot storage,
-or combine every node's rank files before replay (manifest comes from rank0).
+Repeat for the HSDP YAML with snapshots/hsdp. Real capture needs the actual
+training environment and sufficient memory (the 128K forward/backward may OOM).
+Store every rank's CPU tensor file plus rank0's manifest on shared storage or
+combine node files before replay. Existing captures are never overwritten.
+Replay with `SNAPSHOT_ROOT=/experiment/snapshots bash run_muon_step_st.sh`.
+Replay checks layout, topology, shapes, dtypes and optimizer settings; subsequent
+gradients remain fixed, so this is still a dummy training experiment.
+
+## Infrastructure smoke
 
 ```bash
-cd /experiment
-SNAPSHOT_ROOT=/experiment/snapshots bash run_muon_step_st.sh
-```
+# Small matrices only; CPU checks cannot exercise accelerator overlap.
+DEVICE=cpu NPROC_PER_NODE=2 REPEATS=1 \
+bash run_muon_step_st.sh --smoke --scenario fsdp \
+  --warmup-min 4 --warmup-max 60 --stability-window 2 --stable-windows 1 \
+  --stability-cv 0.8 --stability-drift 0.8 --measure-steps 2 --profile-steps 1
 
-Replay checks backend, world size, rank mapping, shapes, dtypes and NS/momentum/LR
-settings. Weights/gradients are captured exactly; gradients then stay fixed across
-warmup and measurement. This is still optimizer-only replay, not resumed training.
-
-## Small infrastructure check
-
-```bash
-NPROC_PER_NODE=4 bash run_muon_step_st.sh --smoke --repeats 1 \
+# Real VeOmni tiny model tree, 4 accelerator ranks, all ablations.
+NPROC_PER_NODE=4 REPEATS=1 BUDGET_MIB=1 \
+MODEL_CONFIG=VeOmni/scripts/muon_step_benchmark/tiny_qwen3_moe \
+bash run_muon_step_st.sh --smoke \
   --warmup-min 8 --warmup-max 100 --stability-window 4 --stable-windows 1 \
-  --measure-steps 3 --profile-steps 2
+  --stability-cv 0.8 --stability-drift 0.8 --measure-steps 3 --profile-steps 2
 ```
 
-This uses 24 small matrices to check launch, both meshes, switches, statistics and
-trace generation. It skips model/VeOmni imports and is clearly labelled in output.
-It is not a performance acceptance test. CPU `--device cpu --smoke` is supported
-for control flow, but cannot exercise accelerator overlap.
-
-To check the real VeOmni meta-wrap and optimizer factory on fewer devices,
-append `--model-config scripts/muon_step_benchmark/tiny_qwen3_moe` to the smoke
-command. The bundled tiny model is only for infrastructure verification. The
-`smoke` field remains true in the workload and result metadata. Optional capture
-replay can likewise use `--smoke` for matching small-world snapshots.
-
-See [validation record](VALIDATION.md) for executed checks and untested coverage.
+CPU supports the matrix control; real VeOmni FSDP wrapping requires NPU or CUDA.
+Smoke results are explicitly marked and are not Qwen performance evidence.
+See [validation record](VALIDATION.md) for executed checks and remaining coverage.
