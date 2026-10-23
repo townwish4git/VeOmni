@@ -76,6 +76,32 @@ The optional `gram-newton-schulz` package and its QuACK dependencies must be ava
 
 CUDA Gram/QuACK optimizer checkpoints record the callback settings. Resuming with different coefficients, epsilon, iteration count, implementation or reset schedule is rejected before loading the leaf optimizer state. A checkpoint without the callback metadata cannot be resumed into this new callback path; use its original optimizer configuration instead.
 
+## Muon performance options and optimizer-step ST
+
+With `use_hyper_optimizer: true`, the optimizer config also accepts:
+
+```yaml
+model:
+  optimizer:
+    type: muon
+    use_hyper_optimizer: true
+    muon_ns_implementation: std
+    muon_momentum_mode: legacy  # legacy | vanilla; changes the momentum formula
+    muon_fsdp_overlap: false
+    muon_fsdp_overlap_memory_budget_bytes: null
+    muon_hsdp_replicate_dedup: true
+```
+
+Defaults retain the existing behavior. The temporary memory budget, when set,
+must be a positive byte count and applies to both serial and overlap buckets.
+These options require Hyper Muon. Overlap eligibility depends on the layout and
+callbacks; HSDP replicate dedup currently prevents the single-axis pipeline.
+
+The standalone [Muon step ST](../../scripts/muon_step_benchmark/README.md)
+provides a movable Bash entry, full FSDP/HSDP ablations, stability warmup,
+unprofiled latency samples, a subsequent profiling window, multi-node launch,
+and optional input capture from a real training first step.
+
 ## Current limitations
 
 - HyperParallel checkpointing does not yet support trainable-only LoRA checkpoints or `dcp_save_to_lowest_rank`.

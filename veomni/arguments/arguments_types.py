@@ -161,6 +161,22 @@ class OptimizerConfig:
         default=0.95,
         metadata={"help": "Momentum factor for the Muon group."},
     )
+    muon_momentum_mode: Literal["legacy", "vanilla"] = field(
+        default="legacy",
+        metadata={"help": "HyperParallel Muon momentum formula; requires use_hyper_optimizer."},
+    )
+    muon_fsdp_overlap: bool = field(
+        default=False,
+        metadata={"help": "Overlap HyperParallel Muon shard communication with Newton-Schulz."},
+    )
+    muon_fsdp_overlap_memory_budget_bytes: Optional[int] = field(
+        default=None,
+        metadata={"help": "HyperParallel temporary bucket budget, also applied to the serial path."},
+    )
+    muon_hsdp_replicate_dedup: bool = field(
+        default=True,
+        metadata={"help": "Deduplicate HyperParallel Muon work across HSDP replicas."},
+    )
     muon_nesterov: bool = field(
         default=True,
         metadata={"help": "Use Nesterov momentum in Muon."},
@@ -255,6 +271,18 @@ class OptimizerConfig:
     def __post_init__(self):
         if self.use_hyper_optimizer and self.type != "muon":
             raise ValueError("use_hyper_optimizer=True requires optimizer type='muon'.")
+        if self.muon_momentum_mode not in ("legacy", "vanilla"):
+            raise ValueError("muon_momentum_mode must be legacy or vanilla.")
+        budget = self.muon_fsdp_overlap_memory_budget_bytes
+        if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0):
+            raise ValueError("muon_fsdp_overlap_memory_budget_bytes must be a positive integer.")
+        if not self.use_hyper_optimizer and (
+            self.muon_momentum_mode != "legacy"
+            or self.muon_fsdp_overlap
+            or budget is not None
+            or not self.muon_hsdp_replicate_dedup
+        ):
+            raise ValueError("HyperParallel Muon performance options require use_hyper_optimizer=True.")
         if self.grad_clip_scope == "global":
             raise NotImplementedError(
                 "model.optimizer.grad_clip_scope='global' needs a clip that spans several "

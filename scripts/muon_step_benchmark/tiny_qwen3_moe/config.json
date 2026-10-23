@@ -1,0 +1,24 @@
+{
+  "architectures": [
+    "Qwen3MoeForCausalLM"
+  ],
+  "model_type": "qwen3_moe",
+  "dtype": "bfloat16",
+  "hidden_size": 64,
+  "intermediate_size": 128,
+  "moe_intermediate_size": 32,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 16,
+  "num_experts": 8,
+  "num_experts_per_tok": 2,
+  "vocab_size": 128,
+  "max_position_embeddings": 256,
+  "tie_word_embeddings": false,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "decoder_sparse_step": 1,
+  "mlp_only_layers": [],
+  "use_cache": false
+}

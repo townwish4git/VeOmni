@@ -641,6 +641,52 @@ class TestMuonKwargsFromOptimizerConfig:
             **kwargs,
         )
 
+    def test_hyper_performance_options_reach_factory(self, monkeypatch):
+        hyper_optimizer = pytest.importorskip("hyper_parallel.core.optimizer")
+
+        from veomni.distributed import hyper_fsdp2
+        from veomni.optim import optimizer as optimizer_impl
+
+        captured = {}
+        leaf = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.01)
+        chain = SimpleNamespace(optimizers_dict={"muon": leaf})
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return chain
+
+        monkeypatch.setattr(hyper_optimizer, "get_hyper_optimizer", factory)
+        monkeypatch.setattr(hyper_fsdp2, "wrap_optimizer", lambda optimizer: None)
+        monkeypatch.setattr(optimizer_impl, "_should_build_extra_parallel_aware", lambda model: False)
+        config = self._muon_config(
+            use_hyper_optimizer=True,
+            muon_momentum_mode="vanilla",
+            muon_fsdp_overlap=True,
+            muon_hsdp_replicate_dedup=False,
+            muon_fsdp_overlap_memory_budget_bytes=1024**3,
+        )
+        assert self._build(config) is chain
+        options = captured["muon_kwargs"]
+        assert options["muon_momentum_mode"] == "vanilla"
+        assert options["muon_fsdp_overlap"] is True
+        assert options["muon_hsdp_replicate_dedup"] is False
+        assert options["muon_fsdp_overlap_memory_budget_bytes"] == 1024**3
+        assert options["muon_ns_variant"] == "custom"
+        assert "muon_zeropower_fn" not in options
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"muon_fsdp_overlap": True},
+            {"muon_momentum_mode": "vanilla"},
+            {"muon_hsdp_replicate_dedup": False},
+            {"muon_fsdp_overlap_memory_budget_bytes": 1024},
+        ],
+    )
+    def test_hyper_options_require_hyper_optimizer(self, options):
+        with pytest.raises(ValueError, match="require use_hyper_optimizer"):
+            self._muon_config(**options)
+
     def test_unset_muon_lr_inherits_the_adamw_lr_under_match_rms(self):
         # match_rms_adamw is also the builder's fallback default, so pin a knob
         # that is not (ns_steps) to prove the config was actually consulted.
