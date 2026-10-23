@@ -32,6 +32,22 @@ from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 
 
+def test_checkpoint_backend_selection_uses_registered_factory(monkeypatch):
+    from veomni.checkpoint.checkpointer import CHECKPOINTER_REGISTRY, build_checkpointer
+
+    calls = []
+    sentinel = object()
+
+    def factory(mode, **kwargs):
+        calls.append((mode, kwargs))
+        return sentinel
+
+    monkeypatch.setitem(CHECKPOINTER_REGISTRY, "dcp", factory)
+    assert build_checkpointer("dcp", "fsdp2") is sentinel
+    assert build_checkpointer("dcp", "fsdp2", fsdp_backend="hyper") is sentinel
+    assert calls == [("fsdp2", {}), ("fsdp2", {"fsdp_backend": "hyper"})]
+
+
 def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
     """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
     from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
@@ -528,7 +544,7 @@ class TestSkipHfWeightLoadOnResume:
         assert not resumed.scale.is_meta
         parallel_state = SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None)
         monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: parallel_state)
-        monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+        monkeypatch.setattr("torch.distributed._composable.fsdp.fully_shard", lambda *args, **kwargs: None)
         monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
 
         resumed = parallelize_model_fsdp2(
@@ -597,7 +613,7 @@ class TestMaterializeAndLoadDispatch:
             "get_parallel_state",
             lambda: SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None),
         )
-        monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+        monkeypatch.setattr("torch.distributed._composable.fsdp.fully_shard", lambda *args, **kwargs: None)
         monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
 
         parallelize_model_fsdp2(

@@ -1,3 +1,4 @@
+import builtins
 import copy
 import gc
 import os
@@ -411,6 +412,25 @@ def test_low_precision_rs_flag_requires_boolean(monkeypatch, value):
         torch_parallelize.parallelize_model_fsdp2(nn.Linear(2, 2), low_precision_reduce_scatter_comm=value)
 
 
+def test_fsdp_backend_factory_keeps_torch_mesh_and_lazy_imports(monkeypatch):
+    from veomni.distributed.fsdp2.backend import get_fsdp2_backend
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.startswith("hyper_parallel"):
+            raise AssertionError("Torch FSDP backend must not import HyperParallel")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    backend = get_fsdp2_backend("torch")
+    mesh = object()
+    assert backend.to_mesh(mesh, "fsdp") is mesh
+    assert backend.weight_load_kwargs() == {}
+    with pytest.raises(ValueError, match="Unsupported fsdp_backend"):
+        get_fsdp2_backend("unknown")
+
+
 def test_low_precision_rs_flag_defaults_off_and_skips_precision_inspection():
     assert FSDPConfig().low_precision_reduce_scatter_comm is False
     assert not validate_low_precision_reduce_scatter_comm(False, object())
@@ -543,7 +563,7 @@ def test_matching_transport_round_trip_preserves_all_finite_16bit_values(dtype):
 def mock_fsdp_builder(monkeypatch):
     state = SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None)
     monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: state)
-    monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+    monkeypatch.setattr("torch.distributed._composable.fsdp.fully_shard", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
     return state
 
@@ -704,7 +724,7 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(
     monkeypatch.setattr(torch_parallelize, "get_runtime_parallel_plan", lambda model: FakePlan())
     monkeypatch.setattr(torch_parallelize, "ReduceScatterTransportPolicy", FakeTransportPolicy)
     monkeypatch.setattr(device_utils, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(torch_parallelize, "fully_shard", record_wrap)
+    monkeypatch.setattr("torch.distributed._composable.fsdp.fully_shard", record_wrap)
     monkeypatch.setattr(
         torch_parallelize, "register_fp32_reduce_scatter_with_low_precision_transport", record_registration
     )
