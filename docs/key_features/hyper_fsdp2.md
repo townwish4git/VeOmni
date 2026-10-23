@@ -102,6 +102,10 @@ original YAML. The ST uses CUDA/NCCL and torch.profiler by default. For two node
 MASTER_ADDR and MODEL_CONFIG on each node, then run
 `bash script.sh --hsdp_dedup=0 --vanilla_momentum=1` independently on both.
 Results and profiles default to `muon_step_results/hsdp_dedup0_overlap0_vanilla/run0/`.
+For matrix execution from one coordinator, set HOSTS, PYTHON, PYTHONPATH,
+MASTER_ADDR and MODEL_CONFIG, then run `scripts/run_muon_step_st.sh` once.
+Remote nodes execute `"$PYTHON" -m torch.distributed.run`. With
+NPROC_PER_NODE=4, both hosts use GPUs 4–7 and the 8-rank HSDP 2×4 YAML.
 
 The standalone [Muon step ST](../../scripts/muon_step_benchmark/README.md)
 provides a movable Bash entry that calls `torchrun tasks/train_muon_step.py`

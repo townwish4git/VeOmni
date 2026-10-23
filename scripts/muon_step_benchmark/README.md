@@ -26,6 +26,14 @@ Run the same flags on both nodes; only NODE_RANK differs. There is no remote
 launch or automatic artifact copying. Uppercase NODE_RANK/MODEL_CONFIG are
 preferred; the lowercase `node_rank` / `model_config` aliases also work.
 
+For two nodes using only the back four GPUs on each eight-GPU host, set
+`NPROC_PER_NODE=4`. Both launchers set `CUDA_VISIBLE_DEVICES=4,5,6,7` for this
+CUDA configuration, including replacing a preexisting visibility list. Total
+world size becomes 8; HSDP uses replicate 2 × shard 4, FSDP uses shard 8.
+The 8-rank YAMLs are selected automatically. At 8 workers per node the existing
+CUDA visibility is preserved, and the total world size remains 16. Python and
+PYTHONPATH are unaffected by GPU selection.
+
 Feature arguments accept either `--name=value` or `--name value`, and override
 the corresponding environment defaults:
 
@@ -36,8 +44,9 @@ the corresponding environment defaults:
 | `--fsdp_overlap=1` | `FSDP_OVERLAP=0` | Request Muon FSDP overlap |
 | `--scenario=fsdp` | `SCENARIO=hsdp` | Select the FSDP 2K YAML instead of HSDP 128K YAML |
 
-The default YAML is `configs/hyperparallel/qwen3_muon_128k_hsdp_16.yaml`;
-FSDP selects `qwen3_muon_2k_16.yaml`. `CONFIG_FILE` explicitly overrides that
+At 16 total ranks the default YAML is `configs/hyperparallel/qwen3_muon_128k_hsdp_16.yaml`;
+FSDP selects `qwen3_muon_2k_16.yaml`. At 8 total ranks these become
+`qwen3_muon_128k_hsdp_8.yaml` (2×4) and `qwen3_muon_2k_8.yaml`, respectively. `CONFIG_FILE` explicitly overrides that
 path. The script uses `torchrun` from your existing PATH, or an explicitly
 configured TORCHRUN. It preserves PYTHON, PYTHON_EXEC, PYTHONPATH and the working
 directory exactly as supplied by the caller. Prepare your environment to import
@@ -179,37 +188,62 @@ torchrun --nproc-per-node=16 VeOmni/tasks/train_muon_step.py \
   --dedup 0 --overlap 1 --momentum vanilla
 ```
 
-## Two machines, 8 devices each
+## Matrix suite: one coordinator launches all hosts
 
-Manual per-node launch directly enters torchrun from Bash. Run on each node
-with `NODE_RANK=0` / `1` and identical flags/RUN_ID:
-
-```bash
-MODEL_CONFIG=/models/Qwen3-30B-A3B NNODES=2 NPROC_PER_NODE=8 \
-NODE_RANK=0 MASTER_ADDR=10.0.0.10 RUN_ID=muon-ablation-001 \
-bash run_muon_step_st.sh
-```
-
-The matrix helper also runs locally only. Launch it independently on both
-nodes with identical RUN_ID and flags. It neither starts remote processes nor
-copies files. Profiles remain on each node unless output is shared; rank0
-summarizes combined timings. Rebuild summaries after manually combining files:
+Configure the environment **only on the coordinator** and run the matrix entry
+once. Both hosts need passwordless SSH, the same checkout/model/interpreter
+paths, and rsync for result collection. MASTER_ADDR must be the first host's
+communication IP reachable from every node.
 
 ```bash
-RUN_ID=muon-ablation-001 bash run_muon_step_st.sh --summarize-only
+export HOSTS=gpu-node0,gpu-node1
+export PYTHON=/path/to/training-env/bin/python
+# Keep your existing PYTHONPATH configured for both source checkouts.
+export MASTER_ADDR=10.0.0.10
+export MODEL_CONFIG=/models/Qwen3-30B-A3B
+export NPROC_PER_NODE=4
+bash VeOmni/scripts/run_muon_step_st.sh
 ```
 
-Rendezvous ports start at `MASTER_PORT=29540`, one per matrix case. Both nodes
-use identical bases; independent suites need different ranges. Port ranges are
-validated against 65535. Case order is deterministically shuffled per repeat by
-Bash; both nodes obtain identical order and ports. GPU communication uses NCCL.
+This launches both hosts through SSH. Each remote Bash worker executes:
+
+```bash
+"$PYTHON" -m torch.distributed.run \
+  --nnodes=2 --nproc-per-node=4 --node-rank=<0-or-1> \
+  --master-addr="$MASTER_ADDR" --master-port=<case-port> \
+  ... tasks/train_muon_step.py configs/hyperparallel/qwen3_muon_128k_hsdp_8.yaml ...
+```
+
+NNODES is inferred from HOSTS; NODE_RANK is assigned by host-list order. RUN_ID
+is generated once on the coordinator and shared by all hosts. PYTHON is required
+for coordinator mode. PYTHONPATH, existing PYTHON_EXEC, PATH, LD_LIBRARY_PATH,
+CUDA/NCCL settings and experiment overrides are forwarded as configured; the
+script adds no Python source paths and rewrites no interpreter path. The remote
+working directory matches the coordinator so relative environment paths retain
+their meaning. Existing PYTHON_EXEC is honored by PyTorch's worker launcher.
+
+Every host independently runs the same deterministic case order and rendezvous
+ports. `NPROC_PER_NODE=4` selects GPUs 4–7 on both hosts and uses HSDP 2×4 (8
+ranks total). `NPROC_PER_NODE=8` uses HSDP 2×8 (16 ranks total).
+Coordinator logs are saved as `coordinator/node<N>.log`; exact SSH commands are
+saved in `dispatch.sh`. After all hosts complete, rsync collects rank artifacts
+and traces, and the configured PYTHON writes the summary/ablation tables. If a
+node fails, remaining SSH jobs are terminated and partial artifacts retrieved.
+
+`--dry-run` with HOSTS prints SSH dispatch commands without contacting hosts.
+Without HOSTS, the matrix entry still supports local/manual launch, using
+`${PYTHON:-python3} -m torch.distributed.run`. Rebuild summaries with
+`RUN_ID=<id> bash VeOmni/scripts/run_muon_step_st.sh --summarize-only`.
+
+Rendezvous ports start at MASTER_PORT=29540, one per case. Independent suites
+need different ranges. GPU communication uses NCCL.
 
 ## Factorial experiments
 
 | Scenario | Dedup | Overlap | Momentum | Cases |
 | --- | --- | --- | --- | --- |
-| FSDP 16 | on (no replicate axis) | off/on | legacy/vanilla | 4 |
-| HSDP 2×8 | on/off | off/on | legacy/vanilla | 8 |
+| FSDP 8 / 16 | on (no replicate axis) | off/on | legacy/vanilla | 4 |
+| HSDP 2×4 / 2×8 | on/off | off/on | legacy/vanilla | 8 |
 
 Default 3 repeats produce 36 independent torchrun jobs. Baseline within each
 topology/repeat is dedup on + overlap off + legacy. `summary.csv` reports matched

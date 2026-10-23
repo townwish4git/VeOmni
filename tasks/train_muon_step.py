@@ -43,6 +43,7 @@ from scripts.muon_step_benchmark.workload import build_workload
 
 
 LOGGER = logging.getLogger(__name__)
+PRODUCTION_WORLD_SIZES = (8, 16)
 
 
 def _arguments():
@@ -101,8 +102,8 @@ def _arguments():
     if not args.smoke and (args.config is None or (args.model_config is None and args.snapshot_root is None)):
         parser.error("Provide the training YAML and model-config or snapshot-root")
     world = int(os.environ.get("WORLD_SIZE", "1"))
-    if not args.smoke and (world != 16 or args.device == "cpu"):
-        parser.error("Production experiments require 16 accelerator ranks")
+    if not args.smoke and (world not in PRODUCTION_WORLD_SIZES or args.device == "cpu"):
+        parser.error("Production experiments require 8 or 16 CUDA ranks")
     if args.profile_ranks != "all":
         try:
             ranks = [int(value) for value in args.profile_ranks.split(",")]
@@ -351,7 +352,7 @@ def _run(args, runtime):
             raise ValueError(f"HyperParallel imports from {actual}, expected editable checkout {args.hyper_root}")
     replicate = 2 if args.scenario == "hsdp" else 1
     world = dist.get_world_size()
-    if world % replicate or (not args.smoke and world != 16):
+    if world % replicate or (not args.smoke and world not in PRODUCTION_WORLD_SIZES):
         raise ValueError(f"Invalid world size {world} for {args.scenario}")
     shape = (replicate, world // replicate) if replicate > 1 else (world,)
     names = ("dp_replicate", "dp_shard_sp") if replicate > 1 else ("dp_shard_sp",)
@@ -387,6 +388,11 @@ def _run(args, runtime):
             "overlap_status": effective,
             "world_size": world,
             "mesh": mesh.mesh.tolist(),
+            "effective_topology": {
+                "world_size": world,
+                "dp_replicate_size": replicate,
+                "dp_shard_size": world // replicate,
+            },
             "source": source["kind"],
             "scope": "dummy training iteration; Muon is the only real training stage",
             "inventory_sha256": source["inventory_sha256"],

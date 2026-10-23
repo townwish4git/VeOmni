@@ -109,17 +109,24 @@ def _dtensor(local, shape, stride, mesh, placements, backend):
 
 
 def _source_configs(args) -> tuple[dict, Any]:
-    name = "qwen3_muon_2k_16.yaml" if args.scenario == "fsdp" else "qwen3_muon_128k_hsdp_16.yaml"
+    world = dist.get_world_size()
+    config_cards = 8 if world == 8 else 16
+    name = (
+        f"qwen3_muon_2k_{config_cards}.yaml"
+        if args.scenario == "fsdp"
+        else f"qwen3_muon_128k_hsdp_{config_cards}.yaml"
+    )
     path = getattr(args, "config", None) or args.veomni_root / "configs" / "hyperparallel" / name
     raw = path.read_text()
     config = yaml.safe_load(raw)
     accelerator = config["model"]["accelerator"]
-    expected = (1, 16) if args.scenario == "fsdp" else (2, 8)
+    replicate = 2 if args.scenario == "hsdp" else 1
     actual = (accelerator["dp_replicate_size"], accelerator["dp_shard_size"])
-    if actual != expected or any(
+    allowed = ((replicate, 8 // replicate), (replicate, 16 // replicate))
+    if actual not in allowed or any(
         accelerator.get(key, 1) != 1 for key in ("ep_size", "tp_size", "pp_size", "cp_size", "ulysses_size")
     ):
-        raise ValueError(f"Unsupported VeOmni topology: {actual}; expected {expected} with other axes disabled")
+        raise ValueError(f"Unsupported VeOmni topology: {actual}; expected {allowed} with other axes disabled")
     fsdp = accelerator["fsdp_config"]
     if fsdp["fsdp_mode"] != "fsdp2" or fsdp.get("offload", False):
         raise ValueError("This extraction supports FSDP2, no-offload scenarios")
@@ -127,6 +134,12 @@ def _source_configs(args) -> tuple[dict, Any]:
         "yaml_path": str(path),
         "yaml": raw,
         "config": config,
+        "source_topology": {"dp_replicate_size": actual[0], "dp_shard_size": actual[1]},
+        "effective_topology": {
+            "world_size": world,
+            "dp_replicate_size": replicate,
+            "dp_shard_size": world // replicate,
+        },
         "effective_fsdp_backend": args.fsdp_backend,
         "forced_use_hyper_optimizer": True,
     }, config["model"]["optimizer"]

@@ -1,5 +1,25 @@
 # GPU Muon ST validation
 
+## Current matrix coordinator and eight-rank configuration
+
+The matrix entry supports one-machine SSH coordination through HOSTS. It passes
+PYTHON/PYTHONPATH and configured runtime variables to each host, assigns node
+ranks, and runs `"$PYTHON" -m torch.distributed.run` on each. Single-case
+`script.sh` remains manual. Both entries select CUDA_VISIBLE_DEVICES=4,5,6,7
+when NPROC_PER_NODE=4 and use the eight-rank YAMLs: HSDP 2×4 or FSDP 8.
+The training entry accepts 8 and 16 CUDA ranks and records source/effective
+topology in its artifacts.
+
+At the user's request, **no server or accelerator run was performed for the
+final coordinator revision**. Local Bash syntax, ruff, compilation and diff
+checks passed. Eight local Bash/planning checks ran with fake SSH/rsync/Python
+executables (no network connections or training), covering remote environment
+quoting, host/node assignment, explicit interpreter requirements, GPU visibility,
+8-rank YAML selection, deterministic ordering and direct torchrun-module argv.
+Real SSH transport, two-host GPU/NCCL execution and performance remain unverified.
+
+## Earlier GPU-entry checks
+
 The ST now defaults to CUDA/NCCL and uses `torch.profiler` with CPU + CUDA
 activities and per-rank Chrome trace export. Device/backend import hooks,
 Ascend profiling branches, HCCL port configuration and Ascend environment probes

@@ -43,7 +43,6 @@ case "$SCENARIO" in
     fsdp) DEFAULT_CONFIG="$VEOMNI_ROOT/configs/hyperparallel/qwen3_muon_2k_16.yaml" ;;
     *) echo 'SCENARIO must be hsdp or fsdp' >&2; exit 2 ;;
 esac
-CONFIG_FILE="${CONFIG_FILE:-$DEFAULT_CONFIG}"
 NNODES="${NNODES:-2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NODE_RANK="${NODE_RANK:-${node_rank:-}}"
@@ -53,9 +52,17 @@ MASTER_PORT="${MASTER_PORT:-29540}"
 for value in "$NNODES" "$NPROC_PER_NODE" "$MASTER_PORT"; do
     if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then echo "Expected positive integer, got $value" >&2; exit 2; fi
 done
+if (( NNODES * NPROC_PER_NODE == 8 )); then
+    DEFAULT_CONFIG="${DEFAULT_CONFIG%_16.yaml}_8.yaml"
+fi
+CONFIG_FILE="${CONFIG_FILE:-$DEFAULT_CONFIG}"
 if (( NNODES == 1 )); then NODE_RANK="${NODE_RANK:-0}"; MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"; fi
 : "${NODE_RANK:?Set NODE_RANK=0 on the first node and NODE_RANK=1 on the second node}"
 : "${MASTER_ADDR:?Set MASTER_ADDR to the first node communication IP on both nodes}"
+# Four workers on an eight-GPU host use the back four physical GPUs.
+if [[ "$DEVICE" == cuda ]] && (( NPROC_PER_NODE == 4 )); then
+    export CUDA_VISIBLE_DEVICES=4,5,6,7
+fi
 if [[ ! "$NODE_RANK" =~ ^[0-9]+$ ]] || (( NODE_RANK >= NNODES )); then echo 'Invalid NODE_RANK' >&2; exit 2; fi
 if (( ! SMOKE )) && [[ -z "$MODEL_CONFIG" && -z "${SNAPSHOT_ROOT:-}" ]]; then
     echo 'Set MODEL_CONFIG to the actual training model config directory' >&2; exit 2
@@ -97,6 +104,9 @@ mkdir -p "$CASE_DIR"
 PLAN="$CASE_DIR/launch-node${NODE_RANK}.sh"
 if ! (set -o noclobber; printf '#!/usr/bin/env bash\n' > "$PLAN") 2>/dev/null; then
     echo "Existing experiment for this node: $PLAN. Set a new RUN_ID on both nodes." >&2; exit 2
+fi
+if [[ "$DEVICE" == cuda ]] && (( NPROC_PER_NODE == 4 )); then
+    printf 'export CUDA_VISIBLE_DEVICES=4,5,6,7\n' >> "$PLAN"
 fi
 printf '%q ' "${command[@]}" >> "$PLAN"; printf '\n' >> "$PLAN"
 exec "${command[@]}"

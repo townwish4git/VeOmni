@@ -1333,6 +1333,7 @@ class TestMuonBashLaunch:
             "TORCHRUN": "/usr/bin/true",
             "OUTPUT_DIR": str(tmp_path / "results"),
             "NNODES": "1",
+            "HOSTS": "",
             "NODE_RANK": "0",
             "NPROC_PER_NODE": "16",
             "RUN_ID": "unit",
@@ -1359,7 +1360,7 @@ class TestMuonBashLaunch:
         assert sum(case.startswith("fsdp_") for case in cases) == 12
         assert sum(case.startswith("hsdp_") for case in cases) == 24
         for command in commands:
-            assert command[0] == "/usr/bin/true"
+            assert command[:3] == [sys.executable, "-m", "torch.distributed.run"]
             assert str(Path(environment["VEOMNI_ROOT"]) / "tasks/train_muon_step.py") in command
             assert "scripts.muon_step_benchmark.run" not in " ".join(command)
         assert not (tmp_path / "results").exists()
@@ -1380,9 +1381,7 @@ class TestMuonBashLaunch:
             for command in commands
         )
         text = script.read_text()
-        assert "HOSTS" not in text
-        assert "ssh " not in text
-        assert "rsync " not in text
+        assert '"${PYTHON:-python3}" -m torch.distributed.run' in text
 
     def test_manual_nodes_share_order_and_ports(self, tmp_path):
         environment = {**self._environment(tmp_path), "NNODES": "2", "NPROC_PER_NODE": "8"}
@@ -1398,9 +1397,92 @@ class TestMuonBashLaunch:
             )
             plans.append([shlex.split(line) for line in result.stdout.splitlines()])
         for first, second in zip(*plans):
+            first[first.index("--log-dir") + 1] = "node-log"
+            second[second.index("--log-dir") + 1] = "node-log"
             assert [part for part in first if not part.startswith("--node-rank=")] == [
                 part for part in second if not part.startswith("--node-rank=")
             ]
+
+    def test_matrix_four_workers_use_back_gpus_and_eight_rank_yaml(self, tmp_path):
+        fake = tmp_path / "torchrun"
+        capture = tmp_path / "launch"
+        fake.write_text(
+            '#!/usr/bin/env bash\nprintf "%s\\n" "$CUDA_VISIBLE_DEVICES" "$@" > "$CAPTURE_LAUNCH"\nexit 77\n'
+        )
+        fake.chmod(0o755)
+        env = {
+            **self._environment(tmp_path),
+            "PYTHON": str(fake),
+            "NNODES": "2",
+            "NPROC_PER_NODE": "4",
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+            "RUN_ID": "eight-ranks",
+            "CAPTURE_LAUNCH": str(capture),
+        }
+        script = Path(env["VEOMNI_ROOT"]) / "scripts/run_muon_step_st.sh"
+        result = subprocess.run(
+            ["bash", str(script), "--repeats", "1", "--cases", "hsdp_dedup0_overlap0_vanilla"],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 77, result.stderr
+        lines = capture.read_text().splitlines()
+        assert lines[0] == "4,5,6,7"
+        assert "--nnodes=2" in lines and "--nproc-per-node=4" in lines
+        assert any(token.endswith("qwen3_muon_128k_hsdp_8.yaml") for token in lines)
+
+    def test_coordinator_dispatches_host_python_and_environment(self, tmp_path):
+        tools = tmp_path / "bin"
+        tools.mkdir()
+        fake_ssh = tools / "ssh"
+        fake_ssh.write_text('#!/usr/bin/env bash\nprintf "%s" "$4" > "$CAPTURE_DISPATCH/$3"\n')
+        fake_ssh.chmod(0o755)
+        fake_rsync = tools / "rsync"
+        fake_rsync.write_text("#!/usr/bin/env bash\nexit 0\n")
+        fake_rsync.chmod(0o755)
+        fake_python = tools / "selected-python"
+        fake_python.write_text("#!/usr/bin/env bash\nexit 0\n")
+        fake_python.chmod(0o755)
+        env = {
+            **self._environment(tmp_path),
+            "HOSTS": "gpu-a,gpu-b",
+            "NPROC_PER_NODE": "4",
+            "PYTHON": str(fake_python),
+            "PYTHONPATH": "./hyper-parallel:./VeOmni:/path with spaces",
+            "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+            "CAPTURE_DISPATCH": str(tmp_path),
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        }
+        script = Path(env["VEOMNI_ROOT"]) / "scripts/run_muon_step_st.sh"
+        subprocess.run(
+            ["bash", str(script), "--repeats", "1", "--cases", "hsdp_dedup0_overlap0_vanilla"],
+            cwd=tmp_path,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for rank, host in enumerate(("gpu-a", "gpu-b")):
+            command = shlex.split((tmp_path / host).read_text())
+            assert command[:2] == ["cd", "--"]
+            assert Path(command[2]).resolve() == tmp_path.resolve()
+            assert "HOSTS=" in command and "NNODES=2" in command and f"NODE_RANK={rank}" in command
+            assert f"PYTHON={fake_python}" in command
+            assert f"PYTHONPATH={env['PYTHONPATH']}" in command
+            assert "CUDA_VISIBLE_DEVICES=4,5,6,7" in command and "NPROC_PER_NODE=4" in command
+            assert str(script) in command
+        assert (tmp_path / "results/unit/dispatch.sh").is_file()
+
+    def test_coordinator_requires_explicit_python(self, tmp_path):
+        env = {**self._environment(tmp_path), "HOSTS": "gpu-a,gpu-b"}
+        env.pop("PYTHON")
+        script = Path(env["VEOMNI_ROOT"]) / "scripts/run_muon_step_st.sh"
+        result = subprocess.run(
+            ["bash", str(script), "--dry-run"], env=env, check=False, capture_output=True, text=True
+        )
+        assert result.returncode != 0 and "Set PYTHON" in result.stderr
 
     def test_summarize_only_does_not_resolve_or_run_torchrun(self, tmp_path):
         environment = self._environment(tmp_path)
@@ -1451,13 +1533,13 @@ class TestMuonBashLaunch:
         assert parameter.grad is original_gradient
         torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 0.25))
 
-    def test_no_python_process_is_needed_before_torchrun(self, tmp_path):
+    def test_matrix_python_runs_torchrun_module_directly(self, tmp_path):
         environment = self._environment(tmp_path)
         executable = tmp_path / "torchrun"
         captured = tmp_path / "called.args"
         executable.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$CAPTURE_ARGS"\nexit 77\n')
         executable.chmod(0o755)
-        environment.update({"TORCHRUN": str(executable), "PYTHON": "/bin/false", "CAPTURE_ARGS": str(captured)})
+        environment.update({"PYTHON": str(executable), "CAPTURE_ARGS": str(captured)})
         script = Path(environment["VEOMNI_ROOT"]) / "scripts/run_muon_step_st.sh"
         result = subprocess.run(
             ["bash", str(script), "--repeats", "1", "--cases", "fsdp_dedup1_overlap0_legacy"],
@@ -1467,6 +1549,7 @@ class TestMuonBashLaunch:
             text=True,
         )
         assert result.returncode == 77, result.stderr
+        assert captured.read_text().splitlines()[:2] == ["-m", "torch.distributed.run"]
         assert "/tasks/train_muon_step.py" in captured.read_text()
 
 
@@ -1673,6 +1756,97 @@ class TestSingleMuonExperimentScript:
         options["on_trace_ready"](profile)
         profile.export_chrome_trace.assert_called_once_with(str(tmp_path / "profiles/rank00000/trace.json"))
         assert result["active_steps"] == 2
+
+    @pytest.mark.parametrize("configured", [None, "0,1,2,3,4,5,6,7"])
+    def test_four_workers_select_back_four_gpus(self, tmp_path, configured):
+        fake = tmp_path / "torchrun"
+        capture = tmp_path / "visible"
+        fake.write_text('#!/usr/bin/env bash\nprintf "%s" "${CUDA_VISIBLE_DEVICES-unset}" > "$CAPTURE_VISIBLE"\n')
+        fake.chmod(0o755)
+        env = {
+            **self._environment(tmp_path),
+            "NPROC_PER_NODE": "4",
+            "TORCHRUN": str(fake),
+            "CAPTURE_VISIBLE": str(capture),
+            "DEVICE": "cuda",
+        }
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+        if configured is not None:
+            env["CUDA_VISIBLE_DEVICES"] = configured
+        subprocess.run(
+            ["bash", str(self._script()), "--hsdp_dedup=0", "--vanilla_momentum=1"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert capture.read_text() == "4,5,6,7"
+        plan = (tmp_path / "results/hsdp_dedup0_overlap0_vanilla/run0/launch-node0.sh").read_text()
+        assert "--nnodes=2" in plan and "--nproc-per-node=4" in plan
+        assert "export CUDA_VISIBLE_DEVICES=4,5,6,7" in plan
+        assert "qwen3_muon_128k_hsdp_8.yaml" in plan
+
+    @pytest.mark.parametrize("workers,device", [("8", "cuda"), ("4", "cpu")])
+    def test_other_launches_preserve_cuda_visibility(self, tmp_path, workers, device):
+        fake = tmp_path / "torchrun"
+        capture = tmp_path / "visible"
+        fake.write_text('#!/usr/bin/env bash\nprintf "%s" "$CUDA_VISIBLE_DEVICES" > "$CAPTURE_VISIBLE"\n')
+        fake.chmod(0o755)
+        env = {
+            **self._environment(tmp_path),
+            "NPROC_PER_NODE": workers,
+            "DEVICE": device,
+            "TORCHRUN": str(fake),
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+            "CAPTURE_VISIBLE": str(capture),
+        }
+        subprocess.run(["bash", str(self._script())], env=env, check=True, capture_output=True, text=True)
+        assert capture.read_text() == "0,1,2,3"
+
+    @pytest.mark.parametrize("world", [8, 16])
+    @pytest.mark.parametrize("scenario", ["fsdp", "hsdp"])
+    def test_eight_and_sixteen_rank_production_topology(self, tmp_path, monkeypatch, world, scenario):
+        pytest.importorskip("hyper_parallel")
+        from scripts.muon_step_benchmark import workload
+        from tasks import train_muon_step
+
+        root = Path(__file__).resolve().parents[2]
+        name = "qwen3_muon_2k_16.yaml" if scenario == "fsdp" else "qwen3_muon_128k_hsdp_16.yaml"
+        config = root / "configs/hyperparallel" / name
+        monkeypatch.setenv("WORLD_SIZE", str(world))
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "train_muon_step.py",
+                str(config),
+                "--output",
+                str(tmp_path),
+                "--model-config",
+                str(tmp_path / "model"),
+                "--case",
+                "unit",
+                "--scenario",
+                scenario,
+                "--momentum",
+                "vanilla",
+                "--dedup",
+                "0",
+                "--overlap",
+                "1",
+            ],
+        )
+        args = train_muon_step._arguments()
+        assert not args.smoke
+        monkeypatch.setattr(workload.dist, "get_world_size", lambda: world)
+        source, _ = workload._source_configs(args)
+        replicate = 2 if scenario == "hsdp" else 1
+        assert source["effective_topology"] == {
+            "world_size": world,
+            "dp_replicate_size": replicate,
+            "dp_shard_size": world // replicate,
+        }
+        assert source["source_topology"]["dp_shard_size"] == (8 if scenario == "hsdp" else 16)
 
     def test_invalid_switch_fails_before_launch(self, tmp_path):
         result = subprocess.run(
