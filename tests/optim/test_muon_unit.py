@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import csv
 import json
 import os
@@ -24,7 +25,7 @@ import subprocess
 import sys
 import weakref
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -1941,3 +1942,93 @@ class TestMuonLogAnalysis:
         log.write_text("INFO Warmup 50: mean 100 ms\n")
         output = self._run(log).stdout
         assert "0/12" in output and "没有匹配的性能结果" in output
+
+
+class TestDummyTextForwardBackward:
+    """Exercise the task-local hack without constructing a model or process group."""
+
+    @staticmethod
+    def _load(parameters, tokens=1, total_tokens=1):
+        local = MagicMock(name="local_gradient")
+        local.normal_.return_value = local
+        gradient = SimpleNamespace(to_local=lambda: local)
+        generator = MagicMock(name="generator")
+        generator.manual_seed.return_value = generator
+        fake_torch = SimpleNamespace(
+            Tensor=object,
+            float32="float32",
+            no_grad=lambda: lambda function: function,
+            empty_like=MagicMock(return_value=gradient),
+            Generator=MagicMock(return_value=generator),
+            tensor=MagicMock(side_effect=lambda value, **kwargs: value),
+        )
+        base = SimpleNamespace(
+            micro_batches_token_len={"foundation_tokens": SimpleNamespace(item=lambda: total_tokens)},
+            micro_batch_token_len={"foundation_tokens": SimpleNamespace(item=lambda: tokens)},
+            args=SimpleNamespace(train=SimpleNamespace(seed=42)),
+            state=SimpleNamespace(global_step=3),
+            model=MagicMock(),
+        )
+        base.model.parameters.return_value = parameters
+        path = Path(__file__).resolve().parents[2] / "tasks" / "train_text.py"
+        definitions = [node for node in ast.parse(path.read_text()).body if isinstance(node, ast.FunctionDef)]
+        namespace = {
+            "torch": fake_torch,
+            "Any": object,
+            "TextTrainer": object,
+            "MethodType": MethodType,
+            "LOGGER": MagicMock(),
+        }
+        exec(compile(ast.Module(body=definitions, type_ignores=[]), str(path), "exec"), namespace)
+        return namespace, base, fake_torch, gradient, local
+
+    @staticmethod
+    def _parameter(**changes):
+        return SimpleNamespace(requires_grad=True, is_meta=False, grad=None, **changes)
+
+    def test_writes_local_dtensor_gradient_without_calling_model(self):
+        parameter = self._parameter()
+        namespace, base, torch_api, gradient, local = self._load([parameter], tokens=1, total_tokens=4)
+        local.device = "cuda:0"
+        loss, losses, auxiliary = namespace["dummy_forward_backward_step"](base, {})
+        assert parameter.grad is gradient and loss == 0.25 and losses == {"dummy_loss": 0.25} and auxiliary == {}
+        torch_api.empty_like.assert_called_once_with(parameter, requires_grad=False)
+        local.mul_.assert_called_once_with(0.25)
+        base.model.assert_not_called()
+        base.model.forward.assert_not_called()
+
+    def test_accumulates_existing_grad_and_skips_frozen_parameters(self):
+        parameter = self._parameter()
+        accumulated = MagicMock(name="accumulated")
+        parameter.grad = SimpleNamespace(to_local=lambda: accumulated)
+        frozen = SimpleNamespace(requires_grad=False)
+        namespace, base, torch_api, gradient, local = self._load([frozen, parameter])
+        namespace["dummy_forward_backward_step"](base, {})
+        accumulated.add_.assert_called_once_with(local)
+        assert parameter.grad is not gradient
+        torch_api.empty_like.assert_called_once_with(parameter, requires_grad=False)
+
+    def test_zero_token_batch_returns_zero_loss_and_gradient_weight(self):
+        namespace, base, _, _, local = self._load([self._parameter()], tokens=0, total_tokens=0)
+        loss, _, _ = namespace["dummy_forward_backward_step"](base, {})
+        assert loss == 0
+        local.mul_.assert_called_once_with(0)
+
+    def test_meta_parameter_is_rejected(self):
+        parameter = self._parameter()
+        parameter.is_meta = True
+        namespace, base, _, _, _ = self._load([parameter])
+        try:
+            namespace["dummy_forward_backward_step"](base, {})
+        except RuntimeError as error:
+            assert "materialized" in str(error)
+        else:
+            raise AssertionError("Meta parameters must not enter the optimizer")
+
+    def test_installation_binds_only_the_selected_trainer_instance(self):
+        namespace, base, _, _, _ = self._load([])
+        other = SimpleNamespace(forward_backward_step="original")
+        namespace["enable_dummy_forward_backward"](SimpleNamespace(base=base))
+        assert base.forward_backward_step.__self__ is base
+        assert other.forward_backward_step == "original"
+        namespace["LOGGER"].warning.assert_called_once()

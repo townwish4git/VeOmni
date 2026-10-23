@@ -1,5 +1,16 @@
 # GPU Muon ST validation
 
+## Dummy forward/backward in the text-training entry
+
+Five local mock checks passed for the task-local replacement: local DTensor
+gradient writes without calling the model, existing-gradient accumulation,
+frozen-parameter skipping, zero-token batches, meta-parameter rejection and
+instance-only method binding. The new test class from `test_muon_unit.py` was
+executed via AST extraction with mocked Torch operations; this does not verify
+real Tensor/DTensor factory dispatch or GPU/NCCL execution. `make quality`,
+compilation, documentation-path and diff checks also passed. No server or
+accelerator validation was performed at the user's request.
+
 ## Offline node0.log analysis
 
 Six hardware-independent checks passed locally for the standalone log analyzer:

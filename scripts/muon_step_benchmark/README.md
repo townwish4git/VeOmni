@@ -293,6 +293,57 @@ skips profiling. Common environment overrides include `REPEATS`, `WARMUP_MIN`,
 `OUTPUT_DIR`. Equivalent CLI flags are accepted; `--cases` selects names shown by
 the dry run. Additional trace flags: `--record-shapes --profile-memory --with-stack`.
 
+## Run the original text-training loop with dummy forward/backward
+
+On this experiment branch, `tasks/train_text.py` defaults to
+`VEOMNI_DUMMY_FWD_BWD=1`. Launch it with the same torchrun command, YAML and dotted
+CLI overrides as ordinary text training. The entry builds the normal TextTrainer,
+then replaces only its `base.forward_backward_step` instance method. Model
+construction/loading, tokenizer, dataset, dataloader, gradient clipping, all
+optimizer leaves (including AdamW), scheduler and configured callbacks/checkpoints
+still execute. A startup warning and `dummy_loss` identify the synthetic run.
+
+Example for two nodes with four local workers each (run once on each node with
+its own NODE_RANK, or use your existing SSH training launcher):
+
+```bash
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+"$PYTHON" -m torch.distributed.run \
+  --nnodes=2 --nproc-per-node=4 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="${MASTER_PORT:-29540}" \
+  VeOmni/tasks/train_text.py \
+  VeOmni/configs/hyperparallel/qwen3_muon_128k_hsdp_8.yaml \
+  --model.model_path "$MODEL_PATH" --data.train_path "$DATA_PATH" \
+  --model.accelerator.fsdp_config.fsdp_backend hyper \
+  --model.optimizer.use_hyper_optimizer true \
+  --model.optimizer.muon_hsdp_replicate_dedup false \
+  --model.optimizer.muon_fsdp_overlap true \
+  --model.optimizer.muon_momentum_mode vanilla
+```
+
+Keep your existing Python interpreter and import environment configured. Model
+and dataset paths must be valid; this entry does not replace their initialization
+with the minimal inventory-only builder used by `tasks/train_muon_step.py`.
+The example selects HSDP 2×4; use the FSDP eight-rank YAML for FSDP.
+The matrix script `run_muon_step_st.sh` continues to target `train_muon_step.py`;
+this change affects the `train_text.py` entry only.
+
+The replacement never calls model forward, pre/postforward, loss.backward or
+FSDP gradient collectives. It populates nonzero normal gradients on existing
+local parameter shards while retaining DTensor layout, treating them as already
+reduced optimizer inputs. Gradients are deterministic for a seed/global step
+and use matching local samples on replica peers. Each micro-batch contributes
+its valid-token fraction of the local step; gradients accumulate until the
+original loop's optimizer step/zero_grad. Frozen parameters are skipped; meta
+parameters are rejected. Detached CPU dummy losses sum to one for a nonempty
+step (zero for an entirely empty step). They carry no convergence meaning.
+
+This is the full training loop with dummy forward/backward, so its step timing
+includes gradient generation, data/callback overhead, clipping and all optimizer
+leaves; it is not the isolated Muon timing window from the ST entry. Configured
+profiling continues to use the normal training profile callbacks. To restore
+real forward/backward for this entry, set `VEOMNI_DUMMY_FWD_BWD=0`.
+
 ## Analyze node0.log before the suite finishes
 
 The standalone log analyzer needs only Python's standard library. It reads a
