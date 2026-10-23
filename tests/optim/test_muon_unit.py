@@ -1577,6 +1577,38 @@ class TestSingleMuonExperimentScript:
         subprocess.run(args, env={**env, "RUN_ID": "repeat2"}, check=True, capture_output=True, text=True)
         assert calls.read_text() == "xx"
 
+    @pytest.mark.parametrize("configured", [True, False])
+    def test_preserves_caller_python_environment_and_working_directory(self, tmp_path, configured):
+        fake = tmp_path / "torchrun"
+        capture = tmp_path / "environment"
+        fake.write_text(
+            '#!/usr/bin/env bash\nprintf "%s\\n" "${PYTHON-unset}" "${PYTHON_EXEC-unset}" '
+            '"${PYTHONPATH-unset}" "$PWD" > "$CAPTURE_ENV"\n'
+        )
+        fake.chmod(0o755)
+        env = self._environment(tmp_path)
+        env.pop("TORCHRUN")
+        env.update({"PATH": str(tmp_path) + os.pathsep + env["PATH"], "CAPTURE_ENV": str(capture)})
+        keys = ("PYTHON", "PYTHON_EXEC", "PYTHONPATH")
+        if configured:
+            values = ("/caller/python", "/caller/worker-python", "./hyper-parallel:./VeOmni:/caller/extra")
+            env.update(dict(zip(keys, values)))
+        else:
+            values = ("unset",) * 3
+            for key in keys:
+                env.pop(key, None)
+        subprocess.run(
+            ["bash", str(self._script()), "--hsdp_dedup=0", "--vanilla_momentum=1"],
+            cwd=tmp_path,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        actual = capture.read_text().splitlines()
+        assert tuple(actual[:3]) == values
+        assert Path(actual[3]).resolve() == tmp_path.resolve()
+
     def test_invalid_switch_fails_before_launch(self, tmp_path):
         result = subprocess.run(
             ["bash", str(self._script()), "--hsdp_dedup=2"],

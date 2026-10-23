@@ -1,5 +1,24 @@
 # Validation record — direct Bash / torchrun entry
 
+## Caller-owned Python environment
+
+Both Bash entries now execute `${TORCHRUN:-torchrun}` directly and leave PYTHON,
+PYTHON_EXEC and PYTHONPATH unchanged, including when those variables are unset.
+They retain the caller working directory so relative environment paths keep
+their original meaning. Interpreter discovery and source-path injection were
+removed. Two regression cases capture the exact inherited values and cwd using
+a stand-in torchrun selected through PATH. The training entry and Muon code
+are unchanged; this revision does not require new accelerator performance tests.
+
+On t129, **27 tests passed** using:
+
+```bash
+python -m pytest -q tests/optim/test_muon_unit.py \
+  -k 'TestSingleMuonExperimentScript or TestMuonBashLaunch or TestMuonKwargsFromOptimizerConfig'
+```
+
+No NPU execution was rerun for this environment-preservation change.
+
 ## Single-case manual entry: script.sh
 
 The repository-root `script.sh` directly execs one torchrun command, defaults

@@ -38,9 +38,11 @@ the corresponding environment defaults:
 
 The default YAML is `configs/hyperparallel/qwen3_muon_128k_hsdp_16.yaml`;
 FSDP selects `qwen3_muon_2k_16.yaml`. `CONFIG_FILE` explicitly overrides that
-path. Source import roots are set automatically through PYTHONPATH.
-`PYTHON` and `TORCHRUN` can select the existing training environment executables.
-No project pip installation or Python launch planner is used.
+path. The script uses `torchrun` from your existing PATH, or an explicitly
+configured TORCHRUN. It preserves PYTHON, PYTHON_EXEC, PYTHONPATH and the working
+directory exactly as supplied by the caller. Prepare your environment to import
+the intended checkouts before launching; there is no interpreter selection,
+source-path injection, project installation or Python launch planner.
 
 ### Results selected by the flags
 
@@ -134,11 +136,13 @@ experiment/
   run_muon_step_st.sh     # copy VeOmni/scripts/run_muon_step_st.sh here
 ```
 
-The Bash entry automatically exports both source roots in `PYTHONPATH` and sets
-`PYTHON_EXEC` so torchrun workers use `PYTHON`. Worker import-path checks ensure
-that those source directories supply the packages. `PYTHON` defaults to python3;
-`TORCHRUN` uses its sibling executable if present, otherwise torchrun from PATH.
-Activate the training environment first, or provide both executable paths.
+The Bash entries use the caller's existing Python environment and source
+import configuration. They do not set or modify PYTHON_EXEC or PYTHONPATH,
+do not locate an interpreter, and keep the original working directory so
+relative entries in PATH/PYTHONPATH retain their meaning. Training is launched
+through `${TORCHRUN:-torchrun}`; its interpreter and worker selection follow
+your environment. Workers still check that imported packages come from the
+requested source roots.
 
 ## One machine, 16 devices
 
@@ -165,7 +169,7 @@ SCENARIO=hsdp NNODES=1 NPROC_PER_NODE=16 MODEL_CONFIG=/models/Qwen3-30B-A3B bash
 A single case can also be launched directly, without the suite Bash script:
 
 ```bash
-export PYTHONPATH="$PWD/hyper-parallel:$PWD/VeOmni${PYTHONPATH:+:$PYTHONPATH}"
+# Use your environment already configured for both source checkouts.
 torchrun --nproc-per-node=16 VeOmni/tasks/train_muon_step.py \
   VeOmni/configs/hyperparallel/qwen3_muon_128k_hsdp_16.yaml \
   --model-config /models/Qwen3-30B-A3B --output ./one-case \
@@ -283,7 +287,7 @@ Muon weights/gradients with empty momentum state:
 
 ```bash
 cd VeOmni
-# PYTHONPATH must include both source roots, as set by the suite Bash entry.
+# Use your existing environment configured to import both source roots.
 torchrun --nproc-per-node=16 -m scripts.muon_step_benchmark.capture \
   --output /experiment/snapshots/fsdp --task tasks/train_text.py -- \
   configs/hyperparallel/qwen3_muon_2k_16.yaml \

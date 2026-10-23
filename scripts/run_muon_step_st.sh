@@ -9,11 +9,6 @@ else
 fi
 VEOMNI_ROOT="$(cd "${VEOMNI_ROOT:-$DEFAULT_VEOMNI_ROOT}" && pwd)"
 HYPER_ROOT="$(cd "${HYPER_ROOT:-$(dirname "$VEOMNI_ROOT")/hyper-parallel}" && pwd)"
-PYTHON="${PYTHON:-python3}"
-PYTHON="$(command -v "$PYTHON")"
-if [[ "$PYTHON" != /* ]]; then PYTHON="$PWD/$PYTHON"; fi
-export PYTHON_EXEC="$PYTHON"
-export PYTHONPATH="$HYPER_ROOT:$VEOMNI_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 # Run this script separately on each node. Only NODE_RANK differs between nodes.
 NNODES="${NNODES:-2}"; NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -71,17 +66,8 @@ if [[ -n "${MODEL_CONFIG:-}" && "$MODEL_CONFIG" != /* ]]; then MODEL_CONFIG="$PW
 if [[ -n "${SNAPSHOT_ROOT:-}" && "$SNAPSHOT_ROOT" != /* ]]; then SNAPSHOT_ROOT="$PWD/$SNAPSHOT_ROOT"; fi
 SUITE_DIR="$OUTPUT_DIR/$RUN_ID"
 if (( SUMMARIZE_ONLY )); then
-    cd "$VEOMNI_ROOT"
-    exec "$PYTHON" -m scripts.muon_step_benchmark.report "$SUITE_DIR"
+    exec "${PYTHON:-python3}" -m scripts.muon_step_benchmark.report "$SUITE_DIR"
 fi
-if [[ -n "${TORCHRUN:-}" ]]; then
-    TORCHRUN="$(command -v "$TORCHRUN")"
-elif [[ -x "$(dirname "$PYTHON")/torchrun" ]]; then
-    TORCHRUN="$(dirname "$PYTHON")/torchrun"
-else
-    TORCHRUN="$(command -v torchrun)"
-fi
-if [[ "$TORCHRUN" != /* ]]; then TORCHRUN="$PWD/$TORCHRUN"; fi
 for value in "$NNODES" "$NPROC_PER_NODE" "$REPEATS" "$MASTER_PORT" "$HCCL_BASE_PORT"; do
     if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then echo "Expected positive integer: $value" >&2; exit 2; fi
 done
@@ -140,7 +126,6 @@ if (( MASTER_PORT < 1024 || MASTER_PORT + TOTAL > 65535 )); then echo 'Rendezvou
 if [[ "$DEVICE" == npu ]] && (( HCCL_BASE_PORT < 1024 || HCCL_BASE_PORT + 256 * TOTAL > 65535 )); then
     echo 'HCCL port range exceeds bounds' >&2; exit 2
 fi
-cd "$VEOMNI_ROOT"
 PLAN="$SUITE_DIR/plan-node${NODE_RANK}.sh"
 if (( ! DRY_RUN )); then
     mkdir -p "$SUITE_DIR"
@@ -161,7 +146,7 @@ for (( trial=0; trial<REPEATS; trial++ )); do
         else config="$VEOMNI_ROOT/configs/hyperparallel/qwen3_muon_128k_hsdp_16.yaml"; fi
         printf -v trial_tag 'r%02d' "$trial"
         case_dir="$SUITE_DIR/${trial_tag}_${name}"
-        command=("$TORCHRUN" --nnodes="$NNODES" --nproc-per-node="$NPROC_PER_NODE" --node-rank="$NODE_RANK"
+        command=("${TORCHRUN:-torchrun}" --nnodes="$NNODES" --nproc-per-node="$NPROC_PER_NODE" --node-rank="$NODE_RANK"
             --master-addr="$MASTER_ADDR" --master-port="$((MASTER_PORT + index))" --max-restarts=0
             --log-dir "$case_dir/torchrun" --tee=3 "$VEOMNI_ROOT/tasks/train_muon_step.py" "$config"
             --veomni-root "$VEOMNI_ROOT" --hyper-root "$HYPER_ROOT" --output "$case_dir"
@@ -186,5 +171,5 @@ for (( trial=0; trial<REPEATS; trial++ )); do
     done
 done
 if (( ! DRY_RUN && NODE_RANK == 0 )); then
-    "$PYTHON" -m scripts.muon_step_benchmark.report "$SUITE_DIR"
+    "${PYTHON:-python3}" -m scripts.muon_step_benchmark.report "$SUITE_DIR"
 fi

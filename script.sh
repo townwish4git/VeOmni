@@ -63,14 +63,6 @@ if [[ -n "$MODEL_CONFIG" && -n "${SNAPSHOT_ROOT:-}" ]]; then echo 'Choose MODEL_
 for variable in CONFIG_FILE MODEL_CONFIG SNAPSHOT_ROOT; do
     if [[ -n "${!variable:-}" && "${!variable}" != /* ]]; then printf -v "$variable" '%s' "$PWD/${!variable}"; fi
 done
-PYTHON="$(command -v "${PYTHON:-python3}")"
-if [[ "$PYTHON" != /* ]]; then PYTHON="$PWD/$PYTHON"; fi
-if [[ -n "${TORCHRUN:-}" ]]; then TORCHRUN="$(command -v "$TORCHRUN")";
-elif [[ -x "$(dirname "$PYTHON")/torchrun" ]]; then TORCHRUN="$(dirname "$PYTHON")/torchrun";
-else TORCHRUN="$(command -v torchrun)"; fi
-if [[ "$TORCHRUN" != /* ]]; then TORCHRUN="$PWD/$TORCHRUN"; fi
-export PYTHON_EXEC="$PYTHON"
-export PYTHONPATH="$HYPER_ROOT:$VEOMNI_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-${HCCL_BASE_PORT:-40000}}"
 MOMENTUM=legacy
@@ -80,7 +72,7 @@ RUN_ID="${RUN_ID:-run0}"
 OUTPUT_DIR="${OUTPUT_DIR:-$(dirname "$VEOMNI_ROOT")/muon_step_results}"
 if [[ "$OUTPUT_DIR" != /* ]]; then OUTPUT_DIR="$PWD/$OUTPUT_DIR"; fi
 CASE_DIR="$OUTPUT_DIR/$CASE_NAME/$RUN_ID"
-command=("$TORCHRUN" --nnodes="$NNODES" --nproc-per-node="$NPROC_PER_NODE" --node-rank="$NODE_RANK"
+command=("${TORCHRUN:-torchrun}" --nnodes="$NNODES" --nproc-per-node="$NPROC_PER_NODE" --node-rank="$NODE_RANK"
     --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" --max-restarts=0
     --log-dir "$CASE_DIR/torchrun/node${NODE_RANK}" --tee=3
     "$VEOMNI_ROOT/tasks/train_muon_step.py" "$CONFIG_FILE"
@@ -107,5 +99,4 @@ if ! (set -o noclobber; printf '#!/usr/bin/env bash\n' > "$PLAN") 2>/dev/null; t
     echo "Existing experiment for this node: $PLAN. Set a new RUN_ID on both nodes." >&2; exit 2
 fi
 printf '%q ' "${command[@]}" >> "$PLAN"; printf '\n' >> "$PLAN"
-cd "$VEOMNI_ROOT"
 exec "${command[@]}"
