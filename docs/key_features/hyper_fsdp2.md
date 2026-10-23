@@ -97,6 +97,12 @@ must be a positive byte count and applies to both serial and overlap buckets.
 These options require Hyper Muon. Overlap eligibility depends on the layout and
 callbacks; HSDP replicate dedup currently prevents the single-axis pipeline.
 
+The repository-root `script.sh` starts one local torchrun experiment using the
+original YAML. For two nodes with eight devices each, set NODE_RANK=0/1,
+MASTER_ADDR and MODEL_CONFIG on each node, then run
+`bash script.sh --hsdp_dedup=0 --vanilla_momentum=1` independently on both.
+Results and profiles default to `muon_step_results/hsdp_dedup0_overlap0_vanilla/run0/`.
+
 The standalone [Muon step ST](../../scripts/muon_step_benchmark/README.md)
 provides a movable Bash entry that calls `torchrun tasks/train_muon_step.py`
 directly. The training replacement retains VeOmni model/shard/optimizer

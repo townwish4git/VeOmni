@@ -1,5 +1,48 @@
 # Validation record — direct Bash / torchrun entry
 
+## Single-case manual entry: script.sh
+
+The repository-root `script.sh` directly execs one torchrun command, defaults
+to NNODES=2/NPROC_PER_NODE=8, accepts `--hsdp_dedup=0 --vanilla_momentum=1`
+and maps these flags to `hsdp_dedup0_overlap0_vanilla/<RUN_ID>/`. The default
+RUN_ID is run0 on both nodes. No remote launching or copying is implemented.
+The optional matrix helper was also changed to local/manual launch only.
+
+On t129, this command passed **25 tests**:
+
+```bash
+python -m pytest -q tests/optim/test_muon_unit.py \
+  -k 'TestSingleMuonExperimentScript or TestMuonBashLaunch or TestMuonKwargsFromOptimizerConfig'
+```
+
+New coverage checks a single direct invocation, default YAML/flag mapping,
+environment overrides, identical case/output names on both nodes, absence of
+remote-launch code, direct execution with PYTHON=/bin/false, and protection of
+existing data unless a new RUN_ID is selected.
+
+Two independent Bash processes were started manually on t129 with NODE_RANK=0
+and 1, respectively (two simulated nodes on one host, CPU/Gloo, one worker each):
+
+```bash
+cd /home/townwish/workspace/projects/veomni-muon-step-st-20261023
+# Run separately for NODE_RANK=0 and NODE_RANK=1.
+NODE_RANK=0 MASTER_ADDR=127.0.0.1 MASTER_PORT=30120 \
+NNODES=2 NPROC_PER_NODE=1 DEVICE=cpu SMOKE=1 RUN_ID=manual-single-v1 \
+PYTHON="$PWD/env/bin/python" TORCHRUN=/home/miniconda3/envs/twx_pt29/bin/torchrun \
+OUTPUT_DIR="$PWD/results/single-case" \
+WARMUP_MIN=4 WARMUP_MAX=40 STABILITY_WINDOW=2 STABLE_WINDOWS=1 \
+STABILITY_CV=1 STABILITY_DRIFT=1 MEASURE_STEPS=2 PROFILE_STEPS=1 PROFILE_WARMUP=1 \
+bash script.sh --hsdp_dedup=0 --vanilla_momentum=1
+```
+
+**Passed:** both manual launchers exited successfully, result.json contained
+2 ranks and the selected dedup/momentum settings, each rank retained two timing
+samples, and two Chrome traces plus both node environment/launch files were
+verified beneath `results/single-case/hsdp_dedup0_overlap0_vanilla/manual-single-v1/`.
+This verifies launch/data plumbing; physical two-host or 16-card NPU execution
+was not rerun for this shell-only revision. The earlier NPU checks below apply
+to the unchanged training entry.
+
 Host: `t129` (Ascend 910B3), 2026-10-23. Source branch:
 `test/hyper-muon-step-ablation`, based on Cui-yshoho VeOmni
 `3b17d580aba07d7e5bb26b9ffcaa3ebd48e745aa`. HyperParallel source:
@@ -51,7 +94,7 @@ PYTHON="$PWD/env/bin/python" \
 TORCHRUN=/home/miniconda3/envs/twx_pt29/bin/torchrun \
 OUTPUT_DIR="$PWD/results" \
 MODEL_CONFIG="$PWD/VeOmni/scripts/muon_step_benchmark/tiny_qwen3_moe" \
-MASTER_PORT=29900 HCCL_BASE_PORT=48000 NPROC_PER_NODE=4 REPEATS=1 DEVICE=npu \
+MASTER_PORT=29900 HCCL_BASE_PORT=48000 NNODES=1 NPROC_PER_NODE=4 REPEATS=1 DEVICE=npu \
 PROFILE_STEPS=2 PROFILE_WARMUP=1 WARMUP_MIN=8 WARMUP_MAX=60 \
 STABILITY_WINDOW=4 STABLE_WINDOWS=1 STABILITY_CV=0.8 STABILITY_DRIFT=0.8 \
 MEASURE_STEPS=3 BUDGET_MIB=1 RUN_ID=direct-npu-model-v1 \

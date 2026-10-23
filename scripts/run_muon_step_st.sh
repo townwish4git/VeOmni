@@ -15,8 +15,10 @@ if [[ "$PYTHON" != /* ]]; then PYTHON="$PWD/$PYTHON"; fi
 export PYTHON_EXEC="$PYTHON"
 export PYTHONPATH="$HYPER_ROOT:$VEOMNI_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-NNODES="${NNODES:-1}"; NPROC_PER_NODE="${NPROC_PER_NODE:-16}"; NODE_RANK="${NODE_RANK:-0}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"; MASTER_PORT="${MASTER_PORT:-29540}"
+# Run this script separately on each node. Only NODE_RANK differs between nodes.
+NNODES="${NNODES:-2}"; NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+EXPLICIT_NODE_RANK="${NODE_RANK:-}"; NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-}"; MASTER_PORT="${MASTER_PORT:-29540}"
 HCCL_BASE_PORT="${HCCL_BASE_PORT:-40000}"
 OUTPUT_DIR="${OUTPUT_DIR:-$(dirname "$VEOMNI_ROOT")/muon_step_results}"
 EXPLICIT_RUN_ID="${RUN_ID:-}"; RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
@@ -86,16 +88,23 @@ done
 if [[ ! "$SEED" =~ ^[0-9]+$ ]]; then echo 'SEED must be a nonnegative integer' >&2; exit 2; fi
 if [[ ! "$NODE_RANK" =~ ^[0-9]+$ ]] || (( NODE_RANK >= NNODES )); then echo 'Invalid NODE_RANK' >&2; exit 2; fi
 if [[ "$SCENARIO" != all && "$SCENARIO" != fsdp && "$SCENARIO" != hsdp ]]; then echo 'Invalid SCENARIO' >&2; exit 2; fi
-if [[ -n "${HOSTS:-}" ]]; then
-    IFS=, read -r -a HOST_ARRAY <<< "$HOSTS"
-    NNODES="${#HOST_ARRAY[@]}"
-    if (( NNODES < 2 )) || [[ "$MASTER_ADDR" == 127.0.0.1 ]]; then
-        echo 'HOSTS needs at least two SSH hosts and a reachable MASTER_ADDR' >&2; exit 2
+if (( NNODES > 1 )); then
+    if [[ -z "$EXPLICIT_NODE_RANK" ]]; then
+        echo 'Set NODE_RANK explicitly: 0 on the first node, 1 on the second node' >&2; exit 2
     fi
-elif (( NNODES > 1 )) && [[ -z "$EXPLICIT_RUN_ID" ]]; then
-    echo 'Set the same explicit RUN_ID on every node' >&2; exit 2
+    if [[ -z "$MASTER_ADDR" ]]; then
+        echo 'Set MASTER_ADDR to the first node IP, using the same value on both nodes' >&2; exit 2
+    fi
+    if [[ -z "$EXPLICIT_RUN_ID" ]]; then
+        echo 'Set the same explicit RUN_ID on every node' >&2; exit 2
+    fi
+else
+    MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 fi
-if (( ! SMOKE && NNODES * NPROC_PER_NODE != 16 )); then echo 'Production runs require 16 ranks' >&2; exit 2; fi
+if (( ! SMOKE && NNODES * NPROC_PER_NODE != 16 )); then
+    echo "Expected 16 total ranks, got $((NNODES * NPROC_PER_NODE)) (NNODES=$NNODES, NPROC_PER_NODE=$NPROC_PER_NODE)" >&2
+    exit 2
+fi
 if [[ "$SCENARIO" != fsdp ]] && (( NNODES * NPROC_PER_NODE % 2 )); then echo 'HSDP needs an even world size' >&2; exit 2; fi
 if (( ! SMOKE )) && [[ -z "${MODEL_CONFIG:-}" && -z "${SNAPSHOT_ROOT:-}" ]]; then
     echo 'Set MODEL_CONFIG to the actual training model config directory, or SNAPSHOT_ROOT' >&2; exit 2
@@ -130,39 +139,6 @@ TOTAL=$(( REPEATS * ${#CASES[@]} ))
 if (( MASTER_PORT < 1024 || MASTER_PORT + TOTAL > 65535 )); then echo 'Rendezvous port range exceeds bounds' >&2; exit 2; fi
 if [[ "$DEVICE" == npu ]] && (( HCCL_BASE_PORT < 1024 || HCCL_BASE_PORT + 256 * TOTAL > 65535 )); then
     echo 'HCCL port range exceeds bounds' >&2; exit 2
-fi
-# Each SSH child executes this Bash file and invokes torchrun itself.
-if [[ -n "${HOSTS:-}" && "$DRY_RUN" == 0 ]]; then
-    mkdir -p "$SUITE_DIR"
-    PIDS=()
-    cleanup() { for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done; }
-    trap cleanup EXIT INT TERM
-    for (( node=0; node<NNODES; node++ )); do
-        remote=(env HOSTS= NNODES="$NNODES" NODE_RANK="$node" RUN_ID="$RUN_ID"
-            VEOMNI_ROOT="$VEOMNI_ROOT" HYPER_ROOT="$HYPER_ROOT" PYTHON="$PYTHON" TORCHRUN="$TORCHRUN")
-        for variable in NPROC_PER_NODE MASTER_ADDR MASTER_PORT HCCL_BASE_PORT OUTPUT_DIR SCENARIO DEVICE FSDP_BACKEND \
-            REPEATS SEED BUDGET_MIB WARMUP_MIN WARMUP_MAX STABILITY_WINDOW STABLE_WINDOWS STABILITY_CV STABILITY_DRIFT \
-            MEASURE_STEPS PROFILE_STEPS PROFILE_WARMUP PROFILE_RANKS TIMEOUT_SECONDS SMOKE MODEL_CONFIG SNAPSHOT_ROOT \
-            ASCEND_RT_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES OMP_NUM_THREADS; do
-            if [[ -n "${!variable:-}" ]]; then remote+=("$variable=${!variable}"); fi
-        done
-        remote+=(bash "$VEOMNI_ROOT/scripts/run_muon_step_st.sh")
-        if (( ${#WORKER_FLAGS[@]} )); then remote+=("${WORKER_FLAGS[@]}"); fi
-        if (( ${#SELECTED[@]} )); then remote+=(--cases "${SELECTED[@]}"); fi
-        printf -v remote_command '%q ' "${remote[@]}"
-        ssh -o BatchMode=yes "${HOST_ARRAY[$node]}" "$remote_command" &
-        PIDS+=("$!")
-    done
-    failed=0
-    for pid in "${PIDS[@]}"; do wait "$pid" || failed=1; done
-    trap - EXIT INT TERM
-    for host in "${HOST_ARRAY[@]}"; do
-        printf -v remote_path '%q' "$SUITE_DIR"
-        rsync -a --ignore-existing "$host:$remote_path/" "$SUITE_DIR/" || failed=1
-    done
-    if (( failed )); then echo "A node or artifact transfer failed; inspect $SUITE_DIR" >&2; exit 1; fi
-    cd "$VEOMNI_ROOT"
-    exec "$PYTHON" -m scripts.muon_step_benchmark.report "$SUITE_DIR"
 fi
 cd "$VEOMNI_ROOT"
 PLAN="$SUITE_DIR/plan-node${NODE_RANK}.sh"

@@ -1,16 +1,85 @@
 # VeOmni dummy training / HyperParallel Muon ST
 
-Launch path:
+The primary entry is the repository-root **`script.sh`**. It starts exactly
+one experiment on the current node and directly executes torchrun:
 
 ```text
-run_muon_step_st.sh
-  └─ torchrun ... tasks/train_muon_step.py <original-training.yaml>
-       └─ MuonStepTrainer: real VeOmni construction + dummy training stages
+script.sh --hsdp_dedup=0 --vanilla_momentum=1
+  └─ exec torchrun ... tasks/train_muon_step.py <default-training.yaml>
 ```
 
-Bash owns the experiment matrix, repeats, case ordering and distributed launch.
-There is no Python experiment launcher. After training jobs finish, Bash invokes
-`report.py` to summarize their existing result files; that module launches no jobs.
+## Two nodes, eight devices each: one experiment
+
+Copy `VeOmni/script.sh` beside `VeOmni/` and `hyper-parallel/`, or run it inside
+the VeOmni checkout. Set these variables on **each node**:
+
+```bash
+export MASTER_ADDR=10.0.0.10        # first node communication IP
+export MODEL_CONFIG=/models/Qwen3-30B-A3B
+export NODE_RANK=0                  # set 1 on the second node
+bash script.sh --hsdp_dedup=0 --vanilla_momentum=1
+```
+
+Defaults are `NNODES=2`, `NPROC_PER_NODE=8`, `MASTER_PORT=29540` and
+`SCENARIO=hsdp`. The first node enters torchrun and waits for the other node.
+Run the same flags on both nodes; only NODE_RANK differs. There is no remote
+launch or automatic artifact copying. Uppercase NODE_RANK/MODEL_CONFIG are
+preferred; the lowercase `node_rank` / `model_config` aliases also work.
+
+Feature arguments accept either `--name=value` or `--name value`, and override
+the corresponding environment defaults:
+
+| Argument | Environment default | Effect |
+| --- | --- | --- |
+| `--hsdp_dedup=0` | `HSDP_DEDUP=1` | Disable HSDP replicate dedup |
+| `--vanilla_momentum=1` | `VANILLA_MOMENTUM=0` | Select vanilla instead of legacy momentum |
+| `--fsdp_overlap=1` | `FSDP_OVERLAP=0` | Request Muon FSDP overlap |
+| `--scenario=fsdp` | `SCENARIO=hsdp` | Select the FSDP 2K YAML instead of HSDP 128K YAML |
+
+The default YAML is `configs/hyperparallel/qwen3_muon_128k_hsdp_16.yaml`;
+FSDP selects `qwen3_muon_2k_16.yaml`. `CONFIG_FILE` explicitly overrides that
+path. Source import roots are set automatically through PYTHONPATH.
+`PYTHON` and `TORCHRUN` can select the existing training environment executables.
+No project pip installation or Python launch planner is used.
+
+### Results selected by the flags
+
+For the example above, the default output is:
+
+```text
+<parent-of-VeOmni>/muon_step_results/
+  hsdp_dedup0_overlap0_vanilla/
+    run0/
+      launch-node0.sh / launch-node1.sh
+      workload.json
+      environment-node0.json / environment-node1.json
+      warmup.json
+      timing-rank00000.json ...
+      result.json
+      torchrun/node0/ ...
+      torchrun/node1/ ...
+      profiles/rank00000/ ...
+```
+
+`OUTPUT_DIR` overrides the **base** directory; the flag-derived case name and
+`RUN_ID` are appended. `RUN_ID=run0` is deterministic on both nodes by default.
+For a repeated experiment set the same new ID on both nodes, for example
+`RUN_ID=repeat2 bash script.sh --hsdp_dedup=0 --vanilla_momentum=1`.
+Existing per-node launch markers prevent accidental overwriting. Profiles and
+worker logs stay on their respective nodes unless output storage is shared;
+rank0 writes combined timing statistics in result.json.
+
+Other environment overrides are `DEVICE`, `FSDP_BACKEND`, `SEED`, `BUDGET_MIB`,
+`WARMUP_MIN`, `WARMUP_MAX`, `STABILITY_WINDOW`, `STABLE_WINDOWS`, `STABILITY_CV`,
+`STABILITY_DRIFT`, `MEASURE_STEPS`, `PROFILE_STEPS`, `PROFILE_WARMUP`,
+`PROFILE_RANKS`, `TIMEOUT_SECONDS` and `TRIAL`. `SNAPSHOT_ROOT` selects captured
+inputs instead of MODEL_CONFIG. Additional training-entry flags, such as
+`--profile-memory --record-shapes --with-stack`, are forwarded directly.
+`--dry-run` prints the final result directory and exactly one torchrun command.
+
+The remainder describes the training entry and the optional **matrix** helper
+`scripts/run_muon_step_st.sh`, which enumerates combinations. Use `script.sh`
+for the single-case, manually launched interface above.
 
 ## Training replacement
 
@@ -77,7 +146,7 @@ From `experiment/`:
 
 ```bash
 cp VeOmni/scripts/run_muon_step_st.sh .
-MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh
+NNODES=1 NPROC_PER_NODE=16 MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh
 ```
 
 `MODEL_CONFIG` is the **same actual model's local HF config directory** as real
@@ -87,10 +156,10 @@ accepted by the VeOmni loader.
 
 ```bash
 # Print all direct torchrun commands without starting Python or training jobs.
-MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh --dry-run
+NNODES=1 NPROC_PER_NODE=16 MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh --dry-run
 
 # Select one topology; use DEVICE=cuda for NVIDIA.
-SCENARIO=hsdp MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh
+SCENARIO=hsdp NNODES=1 NPROC_PER_NODE=16 MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh
 ```
 
 A single case can also be launched directly, without the suite Bash script:
@@ -115,24 +184,10 @@ NODE_RANK=0 MASTER_ADDR=10.0.0.10 RUN_ID=muon-ablation-001 \
 bash run_muon_step_st.sh
 ```
 
-For one-command SSH launch from the coordinator:
-
-```bash
-MODEL_CONFIG=/models/Qwen3-30B-A3B HOSTS=node0,node1 \
-NPROC_PER_NODE=8 MASTER_ADDR=10.0.0.10 \
-PYTHON=/path/to/env/bin/python TORCHRUN=/path/to/env/bin/torchrun \
-bash run_muon_step_st.sh
-```
-
-`HOSTS` contains SSH names/IPs/aliases, first node rank 0. Both nodes need the
-same absolute paths and dependencies; the coordinator needs passwordless SSH
-and rsync. Each SSH child runs the **Bash script**, which sets source paths
-locally and directly calls torchrun. Thus source-only imports also work remotely.
-The SSH shells must supply their normal CANN/CUDA runtime environment.
-
-After jobs finish, profiles are copied back with rsync and results summarized.
-In manual mode rank0 summarizes combined timing results, while profiles stay on
-each rank's node unless output storage is shared. Rebuild summaries after copying:
+The matrix helper also runs locally only. Launch it independently on both
+nodes with identical RUN_ID and flags. It neither starts remote processes nor
+copies files. Profiles remain on each node unless output is shared; rank0
+summarizes combined timings. Rebuild summaries after manually combining files:
 
 ```bash
 RUN_ID=muon-ablation-001 bash run_muon_step_st.sh --summarize-only
@@ -249,13 +304,13 @@ gradients remain fixed, so this is still a dummy training experiment.
 
 ```bash
 # Small matrices only; CPU checks cannot exercise accelerator overlap.
-DEVICE=cpu NPROC_PER_NODE=2 REPEATS=1 \
+NNODES=1 DEVICE=cpu NPROC_PER_NODE=2 REPEATS=1 \
 bash run_muon_step_st.sh --smoke --scenario fsdp \
   --warmup-min 4 --warmup-max 60 --stability-window 2 --stable-windows 1 \
   --stability-cv 0.8 --stability-drift 0.8 --measure-steps 2 --profile-steps 1
 
 # Real VeOmni tiny model tree, 4 accelerator ranks, all ablations.
-NPROC_PER_NODE=4 REPEATS=1 BUDGET_MIB=1 \
+NNODES=1 NPROC_PER_NODE=4 REPEATS=1 BUDGET_MIB=1 \
 MODEL_CONFIG=VeOmni/scripts/muon_step_benchmark/tiny_qwen3_moe \
 bash run_muon_step_st.sh --smoke \
   --warmup-min 8 --warmup-max 100 --stability-window 4 --stable-windows 1 \

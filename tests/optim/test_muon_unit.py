@@ -1334,12 +1334,12 @@ class TestMuonBashLaunch:
             "NNODES": "1",
             "NODE_RANK": "0",
             "NPROC_PER_NODE": "16",
-            "HOSTS": "",
             "RUN_ID": "unit",
             "SCENARIO": "all",
             "DEVICE": "npu",
             "REPEATS": "3",
             "SEED": "42",
+            "MASTER_ADDR": "10.0.0.1",
             "MASTER_PORT": "29540",
             "HCCL_BASE_PORT": "40000",
             "MODEL_CONFIG": str(tmp_path / "model"),
@@ -1364,6 +1364,26 @@ class TestMuonBashLaunch:
             assert str(Path(environment["VEOMNI_ROOT"]) / "tasks/train_muon_step.py") in command
             assert "scripts.muon_step_benchmark.run" not in " ".join(command)
         assert not (tmp_path / "results").exists()
+
+    def test_defaults_target_two_nodes_with_eight_workers(self, tmp_path):
+        environment = self._environment(tmp_path)
+        environment.pop("NNODES")
+        environment.pop("NPROC_PER_NODE")
+        environment["NODE_RANK"] = "1"
+        script = Path(environment["VEOMNI_ROOT"]) / "scripts/run_muon_step_st.sh"
+        result = subprocess.run(
+            ["bash", str(script), "--dry-run"], env=environment, check=True, capture_output=True, text=True
+        )
+        commands = [shlex.split(line) for line in result.stdout.splitlines()]
+        assert len(commands) == 36
+        assert all(
+            "--nnodes=2" in command and "--nproc-per-node=8" in command and "--node-rank=1" in command
+            for command in commands
+        )
+        text = script.read_text()
+        assert "HOSTS" not in text
+        assert "ssh " not in text
+        assert "rsync " not in text
 
     def test_manual_nodes_share_order_and_ports(self, tmp_path):
         environment = {**self._environment(tmp_path), "NNODES": "2", "NPROC_PER_NODE": "8"}
@@ -1449,3 +1469,120 @@ class TestMuonBashLaunch:
         )
         assert result.returncode == 77, result.stderr
         assert "/tasks/train_muon_step.py" in captured.read_text()
+
+
+class TestSingleMuonExperimentScript:
+    """The single-case entry maps user flags and environment directly to torchrun."""
+
+    @staticmethod
+    def _environment(tmp_path):
+        root = Path(__file__).resolve().parents[2]
+        return {
+            **os.environ,
+            "VEOMNI_ROOT": str(root),
+            "HYPER_ROOT": str(tmp_path),
+            "PYTHON": sys.executable,
+            "TORCHRUN": "/usr/bin/true",
+            "OUTPUT_DIR": str(tmp_path / "results"),
+            "NODE_RANK": "0",
+            "MASTER_ADDR": "10.0.0.1",
+            "MODEL_CONFIG": str(tmp_path / "model"),
+            "SCENARIO": "hsdp",
+            "NNODES": "2",
+            "NPROC_PER_NODE": "8",
+            "RUN_ID": "run0",
+            "SMOKE": "0",
+            "SNAPSHOT_ROOT": "",
+            "HSDP_DEDUP": "1",
+            "VANILLA_MOMENTUM": "0",
+            "FSDP_OVERLAP": "0",
+        }
+
+    @staticmethod
+    def _script():
+        return Path(__file__).resolve().parents[2] / "script.sh"
+
+    def test_flags_choose_one_command_and_result_directory(self, tmp_path):
+        env = self._environment(tmp_path)
+        result = subprocess.run(
+            ["bash", str(self._script()), "--hsdp_dedup=0", "--vanilla_momentum=1", "--dry-run"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        lines = result.stdout.splitlines()
+        assert len(lines) == 2
+        command = shlex.split(lines[1])
+        assert command[0] == "/usr/bin/true"
+        assert "--nnodes=2" in command and "--nproc-per-node=8" in command and "--node-rank=0" in command
+        assert command[command.index("--dedup") + 1] == "0"
+        assert command[command.index("--momentum") + 1] == "vanilla"
+        assert command[command.index("--output") + 1] == str(tmp_path / "results/hsdp_dedup0_overlap0_vanilla/run0")
+        assert any(token.endswith("qwen3_muon_128k_hsdp_16.yaml") for token in command)
+        assert not (tmp_path / "results").exists()
+        text = self._script().read_text()
+        assert "ssh " not in text and "HOSTS" not in text and "rsync " not in text
+        assert 'exec "${command[@]}"' in text
+
+    def test_environment_overrides_and_fsdp_yaml(self, tmp_path):
+        env = {**self._environment(tmp_path), "SCENARIO": "fsdp", "PROFILE_STEPS": "7", "WARMUP_MIN": "33"}
+        result = subprocess.run(
+            ["bash", str(self._script()), "--fsdp_overlap=1", "--dry-run"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        command = shlex.split(result.stdout.splitlines()[1])
+        assert any(token.endswith("qwen3_muon_2k_16.yaml") for token in command)
+        assert command[command.index("--profile-steps") + 1] == "7"
+        assert command[command.index("--warmup-min") + 1] == "33"
+        assert command[command.index("--overlap") + 1] == "1"
+        assert "/fsdp_dedup1_overlap1_legacy/run0" in result.stdout
+
+    def test_both_nodes_use_same_result_and_experiment(self, tmp_path):
+        commands = []
+        for node in ("0", "1"):
+            env = {**self._environment(tmp_path), "NODE_RANK": node}
+            result = subprocess.run(
+                ["bash", str(self._script()), "--hsdp_dedup=0", "--vanilla_momentum=1", "--dry-run"],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            commands.append(shlex.split(result.stdout.splitlines()[1]))
+        for option in ("--output", "--case", "--dedup", "--momentum", "--overlap"):
+            assert commands[0][commands[0].index(option) + 1] == commands[1][commands[1].index(option) + 1]
+        assert "--node-rank=0" in commands[0] and "--node-rank=1" in commands[1]
+
+    def test_executes_torchrun_without_python_planning_and_protects_data(self, tmp_path):
+        fake = tmp_path / "torchrun"
+        calls = tmp_path / "calls"
+        fake.write_text('#!/usr/bin/env bash\nprintf x >> "$CAPTURE_CALLS"\n')
+        fake.chmod(0o755)
+        env = {
+            **self._environment(tmp_path),
+            "TORCHRUN": str(fake),
+            "PYTHON": "/bin/false",
+            "CAPTURE_CALLS": str(calls),
+        }
+        args = ["bash", str(self._script()), "--hsdp_dedup=0", "--vanilla_momentum=1"]
+        subprocess.run(args, env=env, check=True, capture_output=True, text=True)
+        retry = subprocess.run(args, env=env, check=False, capture_output=True, text=True)
+        assert retry.returncode == 2 and "Set a new RUN_ID" in retry.stderr
+        assert calls.read_text() == "x"
+        assert (tmp_path / "results/hsdp_dedup0_overlap0_vanilla/run0/launch-node0.sh").is_file()
+        subprocess.run(args, env={**env, "RUN_ID": "repeat2"}, check=True, capture_output=True, text=True)
+        assert calls.read_text() == "xx"
+
+    def test_invalid_switch_fails_before_launch(self, tmp_path):
+        result = subprocess.run(
+            ["bash", str(self._script()), "--hsdp_dedup=2"],
+            env=self._environment(tmp_path),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2 and "Switches must be 0 or 1" in result.stderr
