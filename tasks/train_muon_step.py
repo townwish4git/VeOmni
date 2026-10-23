@@ -19,7 +19,6 @@ optimizer construction without creating a dataset, tokenizer or activation graph
 """
 
 import argparse
-import importlib
 import json
 import logging
 import math
@@ -60,7 +59,7 @@ def _arguments():
     parser.add_argument("--dedup", type=int, choices=(0, 1), required=True)
     parser.add_argument("--overlap", type=int, choices=(0, 1), required=True)
     parser.add_argument("--trial", type=int, default=0)
-    parser.add_argument("--device", choices=("npu", "cuda", "cpu"), default="npu")
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--fsdp-backend", choices=("hyper", "torch"), default="hyper")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--budget-mib", type=int, default=512)
@@ -96,7 +95,7 @@ def _arguments():
     if args.profile_steps < 0 or args.profile_warmup < 0:
         parser.error("Profiling lengths must be nonnegative")
     if args.device == "cpu" and args.model_config:
-        parser.error("Real VeOmni FSDP wrapping requires NPU or CUDA; use the CPU matrix smoke without model-config")
+        parser.error("Real VeOmni FSDP wrapping requires CUDA; use the CPU matrix smoke without model-config")
     if args.model_config and args.snapshot_root:
         parser.error("Choose model-config or snapshot-root")
     if not args.smoke and (args.config is None or (args.model_config is None and args.snapshot_root is None)):
@@ -168,10 +167,13 @@ class DeviceRuntime:
     """Use native Torch device synchronization and the appropriate profiler."""
 
     def __init__(self, device_type: str) -> None:
-        """Initialize the local accelerator before creating HCCL/NCCL process groups."""
+        """Select the local GPU before creating NCCL process groups."""
+        if device_type not in ("cuda", "cpu"):
+            raise ValueError("device_type must be cuda or cpu")
+        if device_type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA is unavailable in the current Python environment")
         self.kind = device_type
-        self.npu_module = importlib.import_module("torch_npu") if device_type == "npu" else None
-        self.backend = getattr(torch, device_type) if device_type != "cpu" else None
+        self.backend = torch.cuda if device_type == "cuda" else None
         if self.backend is not None:
             self.backend.set_device(int(os.environ["LOCAL_RANK"]))
         self.device = torch.device(device_type, int(os.environ["LOCAL_RANK"])) if self.backend else torch.device("cpu")
@@ -276,21 +278,13 @@ def _profile(optimizer, runtime, args):
     context = nullcontext()
     if selected:
         directory.mkdir(parents=True, exist_ok=True)
-        module = runtime.npu_module.profiler if runtime.npu_module else torch.profiler
+        module = torch.profiler
         activities = [module.ProfilerActivity.CPU]
-        options = {}
-        if runtime.kind == "npu":
-            activities.append(module.ProfilerActivity.NPU)
-            _handler = module.tensorboard_trace_handler(str(directory))
-            options["experimental_config"] = module._ExperimentalConfig(  # pylint: disable=protected-access
-                profiler_level=module.ProfilerLevel.Level1, data_simplification=False
-            )
-        else:
-            if runtime.kind == "cuda":
-                activities.append(module.ProfilerActivity.CUDA)
+        if runtime.kind == "cuda":
+            activities.append(module.ProfilerActivity.CUDA)
 
-            def _handler(profiler):
-                profiler.export_chrome_trace(str(directory / "trace.json"))
+        def _handler(profiler):
+            profiler.export_chrome_trace(str(directory / "trace.json"))
 
         context = module.profile(
             activities=activities,
@@ -299,7 +293,6 @@ def _profile(optimizer, runtime, args):
             record_shapes=args.record_shapes,
             profile_memory=args.profile_memory,
             with_stack=args.with_stack,
-            **options,
         )
     runtime.synchronize()
     dist.barrier()
@@ -411,11 +404,9 @@ def _run(args, runtime):
                 "fsdp_backend": args.fsdp_backend,
                 "device_name": runtime.backend.get_device_name() if runtime.backend else "cpu",
                 "hostname": socket.gethostname(),
-                "device_visibility": {
-                    key: os.environ.get(key)
-                    for key in ("ASCEND_RT_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "HCCL_IF_BASE_PORT")
-                },
-                "torch_npu": getattr(runtime.npu_module, "__version__", None),
+                "device_visibility": {"CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES")},
+                "cuda_version": torch.version.cuda,
+                "cudnn_version": torch.backends.cudnn.version() if runtime.kind == "cuda" else None,
             },
         }
         (args.output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -429,7 +420,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _arguments()
     runtime = DeviceRuntime(args.device)
-    backend = {"npu": "hccl", "cuda": "nccl", "cpu": "gloo"}[args.device]
+    backend = {"cuda": "nccl", "cpu": "gloo"}[args.device]
     dist.init_process_group(backend, timeout=timedelta(seconds=args.timeout_seconds))
     args.output.mkdir(parents=True, exist_ok=True)
     if int(os.environ.get("LOCAL_RANK", "0")) == 0:

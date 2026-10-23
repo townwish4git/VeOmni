@@ -98,7 +98,7 @@ These options require Hyper Muon. Overlap eligibility depends on the layout and
 callbacks; HSDP replicate dedup currently prevents the single-axis pipeline.
 
 The repository-root `script.sh` starts one local torchrun experiment using the
-original YAML. For two nodes with eight devices each, set NODE_RANK=0/1,
+original YAML. The ST uses CUDA/NCCL and torch.profiler by default. For two nodes with eight devices each, set NODE_RANK=0/1,
 MASTER_ADDR and MODEL_CONFIG on each node, then run
 `bash script.sh --hsdp_dedup=0 --vanilla_momentum=1` independently on both.
 Results and profiles default to `muon_step_results/hsdp_dedup0_overlap0_vanilla/run0/`.

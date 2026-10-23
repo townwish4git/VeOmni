@@ -1,143 +1,72 @@
-# Validation record — direct Bash / torchrun entry
+# GPU Muon ST validation
 
-## Caller-owned Python environment
+The ST now defaults to CUDA/NCCL and uses `torch.profiler` with CPU + CUDA
+activities and per-rank Chrome trace export. Device/backend import hooks,
+Ascend profiling branches, HCCL port configuration and Ascend environment probes
+were removed from the ST entry, launchers and reporting helper. CPU/Gloo remains
+available only for infrastructure smoke. Python interpreter and import-path
+selection remain entirely owned by the caller environment.
 
-Both Bash entries now execute `${TORCHRUN:-torchrun}` directly and leave PYTHON,
-PYTHON_EXEC and PYTHONPATH unchanged, including when those variables are unset.
-They retain the caller working directory so relative environment paths keep
-their original meaning. Interpreter discovery and source-path injection were
-removed. Two regression cases capture the exact inherited values and cwd using
-a stand-in torchrun selected through PATH. The training entry and Muon code
-are unchanged; this revision does not require new accelerator performance tests.
+Source branch: `test/hyper-muon-step-ablation`, based on Cui-yshoho VeOmni
+`3b17d580aba07d7e5bb26b9ffcaa3ebd48e745aa`. HyperParallel source used for
+hardware-independent checks: `81439e916d11b09ec8cab71506dd7e17ec99152b`.
 
-On t129, **27 tests passed** using:
+## Executed checks
 
-```bash
-python -m pytest -q tests/optim/test_muon_unit.py \
-  -k 'TestSingleMuonExperimentScript or TestMuonBashLaunch or TestMuonKwargsFromOptimizerConfig'
-```
-
-No NPU execution was rerun for this environment-preservation change.
-
-## Single-case manual entry: script.sh
-
-The repository-root `script.sh` directly execs one torchrun command, defaults
-to NNODES=2/NPROC_PER_NODE=8, accepts `--hsdp_dedup=0 --vanilla_momentum=1`
-and maps these flags to `hsdp_dedup0_overlap0_vanilla/<RUN_ID>/`. The default
-RUN_ID is run0 on both nodes. No remote launching or copying is implemented.
-The optional matrix helper was also changed to local/manual launch only.
-
-On t129, this command passed **25 tests**:
+On t129, Python 3.11 / Torch 2.9.0, this command passed **29 tests**:
 
 ```bash
 python -m pytest -q tests/optim/test_muon_unit.py \
   -k 'TestSingleMuonExperimentScript or TestMuonBashLaunch or TestMuonKwargsFromOptimizerConfig'
 ```
 
-New coverage checks a single direct invocation, default YAML/flag mapping,
-environment overrides, identical case/output names on both nodes, absence of
-remote-launch code, direct execution with PYTHON=/bin/false, and protection of
-existing data unless a new RUN_ID is selected.
+Coverage includes:
 
-Two independent Bash processes were started manually on t129 with NODE_RANK=0
-and 1, respectively (two simulated nodes on one host, CPU/Gloo, one worker each):
+- Default CUDA selection and absence of device-extension import/profiler branches.
+- CUDA profiling requests CPU + CUDA activities from torch.profiler, runs the
+  expected warmup/active iteration count, and exports profiles/rank00000/trace.json.
+  This interface test uses a mocked profiler; it does not run GPU kernels.
+- Direct single-case torchrun launch, YAML/flag mapping, environment overrides,
+  matching node result directories and preservation of prior experiment data.
+- Exact preservation of PYTHON/PYTHON_EXEC/PYTHONPATH and caller working directory,
+  including when those environment variables are unset.
+- Manual matrix planning, per-case rendezvous ports, identical node order,
+  dummy training stages and optimizer config forwarding.
+
+A real two-process **CPU/Gloo** smoke completed and produced two timing samples
+per rank, result.json, and two Chrome traces under:
+
+```text
+results/single-case/hsdp_dedup0_overlap0_vanilla/gpu-only-cpu-v1/
+```
+
+The caller supplied its environment explicitly for this test; script.sh did not
+set the Python-related variables:
 
 ```bash
 cd /home/townwish/workspace/projects/veomni-muon-step-st-20261023
-# Run separately for NODE_RANK=0 and NODE_RANK=1.
-NODE_RANK=0 MASTER_ADDR=127.0.0.1 MASTER_PORT=30120 \
-NNODES=2 NPROC_PER_NODE=1 DEVICE=cpu SMOKE=1 RUN_ID=manual-single-v1 \
-PYTHON="$PWD/env/bin/python" TORCHRUN=/home/miniconda3/envs/twx_pt29/bin/torchrun \
+NNODES=1 NPROC_PER_NODE=2 NODE_RANK=0 MASTER_PORT=30160 \
+DEVICE=cpu SMOKE=1 RUN_ID=gpu-only-cpu-v1 \
+TORCHRUN=/home/miniconda3/envs/twx_pt29/bin/torchrun \
+PYTHON_EXEC="$PWD/env/bin/python" PYTHONPATH="$PWD/hyper-parallel:$PWD/VeOmni" \
 OUTPUT_DIR="$PWD/results/single-case" \
 WARMUP_MIN=4 WARMUP_MAX=40 STABILITY_WINDOW=2 STABLE_WINDOWS=1 \
 STABILITY_CV=1 STABILITY_DRIFT=1 MEASURE_STEPS=2 PROFILE_STEPS=1 PROFILE_WARMUP=1 \
-bash script.sh --hsdp_dedup=0 --vanilla_momentum=1
+bash VeOmni/script.sh --hsdp_dedup=0 --vanilla_momentum=1
 ```
 
-**Passed:** both manual launchers exited successfully, result.json contained
-2 ranks and the selected dedup/momentum settings, each rank retained two timing
-samples, and two Chrome traces plus both node environment/launch files were
-verified beneath `results/single-case/hsdp_dedup0_overlap0_vanilla/manual-single-v1/`.
-This verifies launch/data plumbing; physical two-host or 16-card NPU execution
-was not rerun for this shell-only revision. The earlier NPU checks below apply
-to the unchanged training entry.
+Static validation passed `make quality` with repository-locked ruff 0.13.2,
+explicit ruff check/format for the benchmark helpers, Python compilation,
+`bash -n` for both launchers and `git diff --check`.
 
-Host: `t129` (Ascend 910B3), 2026-10-23. Source branch:
-`test/hyper-muon-step-ablation`, based on Cui-yshoho VeOmni
-`3b17d580aba07d7e5bb26b9ffcaa3ebd48e745aa`. HyperParallel source:
-`81439e916d11b09ec8cab71506dd7e17ec99152b`.
+## Unverified coverage
 
-This revision replaces the Python suite launcher with direct Bash → torchrun →
-`tasks/train_muon_step.py`. The default workload retains the actual wrapped
-VeOmni model tree, materializes Muon shards only, and leaves non-Muon parameters
-on meta. All non-Muon training stages are dummy.
+No CUDA GPU was available for runtime validation. Actual CUDA kernels, NCCL
+collectives, GPU overlap performance and CUDA hardware profiling remain
+unverified for this revision. No 16-GPU full-size model, physical two-host GPU
+experiment or convergence test was run. Earlier accelerator results from a
+different backend do not establish CUDA performance or correctness.
 
-Environment: Python 3.11 workers, Torch/torch_npu 2.9.0, transformers 5.16.1,
-NumPy 1.26.4, CANN 8.5.0. torchrun came from the matching Torch 2.9 Python 3.10
-installation; `PYTHON_EXEC` selected the Python 3.11 workers. Source imports were
-selected through the Bash entry's PYTHONPATH and checked by workers.
-
-Checks:
-
-- `make quality` with repository-locked ruff 0.13.2, explicit ruff checks on
-  benchmark helpers, Python compilation, `bash -n`, and `git diff --check`.
-- `python -m pytest -q tests/optim/test_muon_unit.py -k
-  'TestMuonBashLaunch or TestMuonKwargsFromOptimizerConfig'`: **19 passed**.
-  Coverage includes the 36-job matrix/unique ports, identical node ordering,
-  direct invocation of a torchrun stand-in while PYTHON is `/bin/false`,
-  reporting without resolving torchrun, dummy stages preserving gradients/skipping unrelated updates, and Hyper
-  config/factory forwarding. These checks do not need accelerator execution.
-- Bash copied to the outer directory, including relative executable and model
-  paths, passed dry-run checks without any Python planning process.
-- Two-process CPU/Gloo matrix control: **4 completed FSDP cases**, each with
-  a separate unprofiled timing window and CPU Chrome trace on both ranks.
-- Four-card direct Bash entry with actual tiny Qwen3-MoE: **2 completed cases /
-  8 parsed NPU traces**, covering FSDP 4 and HSDP 2×2, vanilla momentum and
-  requested overlap. The HSDP dedup-off case executed pipeline buckets; the
-  small FSDP case reported single-bucket fallback. The source YAML supplied
-  five custom-coefficient NS iterations. Non-Muon AdamW groups were constructed
-  from meta parameters and remained dummy.
-- Full real-model four-card matrix: **12 completed cases / 48 parsed NPU traces**,
-  with **16** matched single-factor pairs. Every workload retained the original
-  wrapped Qwen3-MoE model class, 14 Muon tensors and non-Muon meta parameters.
-- A separate four-card 24-matrix FSDP control confirmed actual multibucket pipeline
-  execution through the new direct training entry, with at least two buckets per
-  rank and **4 parsed NPU traces**.
-
-The two-case NPU command was:
-
-```bash
-cd /home/townwish/workspace/projects/veomni-muon-step-st-20261023
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
-PYTHON="$PWD/env/bin/python" \
-TORCHRUN=/home/miniconda3/envs/twx_pt29/bin/torchrun \
-OUTPUT_DIR="$PWD/results" \
-MODEL_CONFIG="$PWD/VeOmni/scripts/muon_step_benchmark/tiny_qwen3_moe" \
-MASTER_PORT=29900 HCCL_BASE_PORT=48000 NNODES=1 NPROC_PER_NODE=4 REPEATS=1 DEVICE=npu \
-PROFILE_STEPS=2 PROFILE_WARMUP=1 WARMUP_MIN=8 WARMUP_MAX=60 \
-STABILITY_WINDOW=4 STABLE_WINDOWS=1 STABILITY_CV=0.8 STABILITY_DRIFT=0.8 \
-MEASURE_STEPS=3 BUDGET_MIB=1 RUN_ID=direct-npu-model-v1 \
-bash run_muon_step_st.sh --smoke \
-  --cases fsdp_dedup1_overlap1_vanilla hsdp_dedup0_overlap1_vanilla
-```
-
-The full matrix uses the same command with no `--cases`, `PROFILE_STEPS=1`,
-`MASTER_PORT=29940`, `HCCL_BASE_PORT=50000`, and
-`RUN_ID=direct-npu-full-matrix-v1`.
-
-The FSDP multibucket control uses the same Bash entry with MODEL_CONFIG unset,
-`MASTER_PORT=29980`, `HCCL_BASE_PORT=55000`, `PROFILE_STEPS=2`,
-`RUN_ID=direct-npu-fsdp-pipeline-v1`, and
-`--smoke --cases fsdp_dedup1_overlap1_legacy`.
-
-Warnings: CANN installation ownership, deprecated TypedStorage, NPU base-format
-normalization, and profiler export-type normalization to text. The first attempt
-at a real-model CPU check correctly encountered HP's accelerator-only fully_shard
-constraint; the CLI now rejects that combination before distributed setup.
-CPU matrix smoke remains supported.
-
-Smoke runs use relaxed stability tolerances for infrastructure checks, not
-performance acceptance. The production defaults remain 5% CV / 3% median drift.
-No 16-device full-size model, 128K forward/backward, two-host SSH fan-out, CUDA,
-numerical acceptance or convergence experiment was run for this revision.
-Raw logs and results remain under the isolated validation directory above.
+Smoke runs use relaxed stability thresholds for control-flow verification;
+production defaults remain 5% CV / 3% median drift. Raw logs are retained in the
+isolated validation directory shown above.

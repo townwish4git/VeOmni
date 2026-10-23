@@ -14,10 +14,9 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 NNODES="${NNODES:-2}"; NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 EXPLICIT_NODE_RANK="${NODE_RANK:-}"; NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-}"; MASTER_PORT="${MASTER_PORT:-29540}"
-HCCL_BASE_PORT="${HCCL_BASE_PORT:-40000}"
 OUTPUT_DIR="${OUTPUT_DIR:-$(dirname "$VEOMNI_ROOT")/muon_step_results}"
 EXPLICIT_RUN_ID="${RUN_ID:-}"; RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
-SCENARIO="${SCENARIO:-all}"; DEVICE="${DEVICE:-npu}"; FSDP_BACKEND="${FSDP_BACKEND:-hyper}"
+SCENARIO="${SCENARIO:-all}"; DEVICE="${DEVICE:-cuda}"; FSDP_BACKEND="${FSDP_BACKEND:-hyper}"
 REPEATS="${REPEATS:-3}"; SEED="${SEED:-42}"; BUDGET_MIB="${BUDGET_MIB:-512}"
 WARMUP_MIN="${WARMUP_MIN:-20}"; WARMUP_MAX="${WARMUP_MAX:-200}"
 STABILITY_WINDOW="${STABILITY_WINDOW:-10}"; STABLE_WINDOWS="${STABLE_WINDOWS:-3}"
@@ -68,7 +67,7 @@ SUITE_DIR="$OUTPUT_DIR/$RUN_ID"
 if (( SUMMARIZE_ONLY )); then
     exec "${PYTHON:-python3}" -m scripts.muon_step_benchmark.report "$SUITE_DIR"
 fi
-for value in "$NNODES" "$NPROC_PER_NODE" "$REPEATS" "$MASTER_PORT" "$HCCL_BASE_PORT"; do
+for value in "$NNODES" "$NPROC_PER_NODE" "$REPEATS" "$MASTER_PORT"; do
     if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then echo "Expected positive integer: $value" >&2; exit 2; fi
 done
 if [[ ! "$SEED" =~ ^[0-9]+$ ]]; then echo 'SEED must be a nonnegative integer' >&2; exit 2; fi
@@ -123,9 +122,6 @@ if (( ${#SELECTED[@]} )); then
 fi
 TOTAL=$(( REPEATS * ${#CASES[@]} ))
 if (( MASTER_PORT < 1024 || MASTER_PORT + TOTAL > 65535 )); then echo 'Rendezvous port range exceeds bounds' >&2; exit 2; fi
-if [[ "$DEVICE" == npu ]] && (( HCCL_BASE_PORT < 1024 || HCCL_BASE_PORT + 256 * TOTAL > 65535 )); then
-    echo 'HCCL port range exceeds bounds' >&2; exit 2
-fi
 PLAN="$SUITE_DIR/plan-node${NODE_RANK}.sh"
 if (( ! DRY_RUN )); then
     mkdir -p "$SUITE_DIR"
@@ -161,7 +157,6 @@ for (( trial=0; trial<REPEATS; trial++ )); do
         if (( SMOKE )); then command+=(--smoke); fi
         if (( ${#WORKER_FLAGS[@]} )); then command+=("${WORKER_FLAGS[@]}"); fi
         invocation=("${command[@]}")
-        if [[ "$DEVICE" == npu ]]; then invocation=(env "HCCL_IF_BASE_PORT=$((HCCL_BASE_PORT + 256 * index))" "${command[@]}"); fi
         printf '%q ' "${invocation[@]}"; printf '\n'
         if (( ! DRY_RUN )); then
             printf '%q ' "${invocation[@]}" >> "$PLAN"; printf '\n' >> "$PLAN"

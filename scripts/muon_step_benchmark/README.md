@@ -21,7 +21,7 @@ bash script.sh --hsdp_dedup=0 --vanilla_momentum=1
 ```
 
 Defaults are `NNODES=2`, `NPROC_PER_NODE=8`, `MASTER_PORT=29540` and
-`SCENARIO=hsdp`. The first node enters torchrun and waits for the other node.
+`SCENARIO=hsdp`, `DEVICE=cuda`. The first node enters torchrun and waits for the other node.
 Run the same flags on both nodes; only NODE_RANK differs. There is no remote
 launch or automatic artifact copying. Uppercase NODE_RANK/MODEL_CONFIG are
 preferred; the lowercase `node_rank` / `model_config` aliases also work.
@@ -78,6 +78,8 @@ Other environment overrides are `DEVICE`, `FSDP_BACKEND`, `SEED`, `BUDGET_MIB`,
 inputs instead of MODEL_CONFIG. Additional training-entry flags, such as
 `--profile-memory --record-shapes --with-stack`, are forwarded directly.
 `--dry-run` prints the final result directory and exactly one torchrun command.
+The entry supports CUDA training and CPU infrastructure smoke only; it has no
+Ascend backend/profiler dependency and performs no device-backend imports.
 
 The remainder describes the training entry and the optional **matrix** helper
 `scripts/run_muon_step_st.sh`, which enumerates combinations. Use `script.sh`
@@ -123,10 +125,10 @@ completion, with Muon as the only real training stage. They are optimizer latenc
 results, not full-training speedups. The 2K/128K sequence lengths affect real
 forward/backward but do not change this dummy iteration's work.
 
-## Source-only setup
+## GPU environment and source-only setup
 
-Use an existing VeOmni training environment with its dependencies, matching
-Torch/torch_npu/CANN or CUDA, Python 3.11/3.12 and transformers 5.16.1.
+Use an existing GPU VeOmni training environment with its dependencies,
+CUDA-enabled Torch/NCCL, Python 3.11/3.12 and transformers 5.16.1.
 The two project checkouts themselves do **not** need pip installation.
 
 ```text
@@ -162,7 +164,7 @@ accepted by the VeOmni loader.
 # Print all direct torchrun commands without starting Python or training jobs.
 NNODES=1 NPROC_PER_NODE=16 MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh --dry-run
 
-# Select one topology; use DEVICE=cuda for NVIDIA.
+# Select one topology; CUDA/NCCL is the default.
 SCENARIO=hsdp NNODES=1 NPROC_PER_NODE=16 MODEL_CONFIG=/models/Qwen3-30B-A3B bash run_muon_step_st.sh
 ```
 
@@ -197,11 +199,10 @@ summarizes combined timings. Rebuild summaries after manually combining files:
 RUN_ID=muon-ablation-001 bash run_muon_step_st.sh --summarize-only
 ```
 
-Rendezvous ports start at `MASTER_PORT=29540`, one per case. NPU cases use distinct
-`HCCL_IF_BASE_PORT` ranges starting at `HCCL_BASE_PORT=40000`, 256 ports per case.
-Both nodes use identical bases; independent suites need different ranges.
-Port ranges are validated against 65535. Case order is deterministically shuffled
-per repeat by Bash; both nodes obtain identical order and ports.
+Rendezvous ports start at `MASTER_PORT=29540`, one per matrix case. Both nodes
+use identical bases; independent suites need different ranges. Port ranges are
+validated against 65535. Case order is deterministically shuffled per repeat by
+Bash; both nodes obtain identical order and ports. GPU communication uses NCCL.
 
 ## Factorial experiments
 
@@ -247,7 +248,7 @@ Defaults:
 4. Flush timing artifacts, then start a **separate** profiler window: 2 warmup +
    5 active iterations. Profile all ranks by default; `--profile-ranks 0,8`
    selects ranks while every rank still runs the same iterations. CUDA exports
-   Chrome JSON; NPU exports Level1 native traces and operator data.
+   Chrome JSON through `torch.profiler` (CPU + CUDA activities).
 
 Step synchronization measures isolated iteration latency, including Muon's internal
 overlap. `max_rank_window_ms` includes alignment overhead and is not throughput.
@@ -273,7 +274,7 @@ muon_step_results/<RUN_ID>/
     result.json                     # combined ranks, statistics, peaks, environment
     failure-rank00000.json          # on failure
     torchrun/                       # per-worker stdout/stderr
-    profiles/rank00000/              # per-rank traces
+    profiles/rank00000/trace.json    # per-rank Chrome traces
 ```
 
 No outliers are trimmed. Keep repeats separate when comparing results. A profiler
@@ -321,6 +322,6 @@ bash run_muon_step_st.sh --smoke \
   --stability-cv 0.8 --stability-drift 0.8 --measure-steps 3 --profile-steps 2
 ```
 
-CPU supports the matrix control; real VeOmni FSDP wrapping requires NPU or CUDA.
+CPU supports the matrix control; real VeOmni FSDP wrapping requires CUDA.
 Smoke results are explicitly marked and are not Qwen performance evidence.
 See [validation record](VALIDATION.md) for executed checks and remaining coverage.

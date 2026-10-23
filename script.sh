@@ -10,6 +10,7 @@ fi
 VEOMNI_ROOT="$(cd "${VEOMNI_ROOT:-$DEFAULT_VEOMNI_ROOT}" && pwd)"
 HYPER_ROOT="$(cd "${HYPER_ROOT:-$(dirname "$VEOMNI_ROOT")/hyper-parallel}" && pwd)"
 SCENARIO="${SCENARIO:-hsdp}"
+DEVICE="${DEVICE:-cuda}"
 HSDP_DEDUP="${HSDP_DEDUP:-1}"
 VANILLA_MOMENTUM="${VANILLA_MOMENTUM:-0}"
 FSDP_OVERLAP="${FSDP_OVERLAP:-0}"
@@ -64,7 +65,6 @@ for variable in CONFIG_FILE MODEL_CONFIG SNAPSHOT_ROOT; do
     if [[ -n "${!variable:-}" && "${!variable}" != /* ]]; then printf -v "$variable" '%s' "$PWD/${!variable}"; fi
 done
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-${HCCL_BASE_PORT:-40000}}"
 MOMENTUM=legacy
 if (( VANILLA_MOMENTUM )); then MOMENTUM=vanilla; fi
 CASE_NAME="${SCENARIO}_dedup${HSDP_DEDUP}_overlap${FSDP_OVERLAP}_${MOMENTUM}"

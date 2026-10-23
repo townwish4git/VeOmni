@@ -24,6 +24,7 @@ import sys
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -1336,12 +1337,11 @@ class TestMuonBashLaunch:
             "NPROC_PER_NODE": "16",
             "RUN_ID": "unit",
             "SCENARIO": "all",
-            "DEVICE": "npu",
+            "DEVICE": "cuda",
             "REPEATS": "3",
             "SEED": "42",
             "MASTER_ADDR": "10.0.0.1",
             "MASTER_PORT": "29540",
-            "HCCL_BASE_PORT": "40000",
             "MODEL_CONFIG": str(tmp_path / "model"),
             "SNAPSHOT_ROOT": "",
         }
@@ -1354,13 +1354,12 @@ class TestMuonBashLaunch:
         )
         commands = [shlex.split(line) for line in result.stdout.splitlines()]
         assert len(commands) == 36
-        assert len({command[1] for command in commands}) == 36
+        assert len({token for command in commands for token in command if token.startswith("--master-port=")}) == 36
         cases = [command[command.index("--case") + 1] for command in commands]
         assert sum(case.startswith("fsdp_") for case in cases) == 12
         assert sum(case.startswith("hsdp_") for case in cases) == 24
         for command in commands:
-            assert command[:1] == ["env"]
-            assert command[2] == "/usr/bin/true"
+            assert command[0] == "/usr/bin/true"
             assert str(Path(environment["VEOMNI_ROOT"]) / "tasks/train_muon_step.py") in command
             assert "scripts.muon_step_benchmark.run" not in " ".join(command)
         assert not (tmp_path / "results").exists()
@@ -1608,6 +1607,72 @@ class TestSingleMuonExperimentScript:
         actual = capture.read_text().splitlines()
         assert tuple(actual[:3]) == values
         assert Path(actual[3]).resolve() == tmp_path.resolve()
+
+    def test_gpu_default_has_no_npu_runtime_dependencies(self, tmp_path, monkeypatch):
+        env = self._environment(tmp_path)
+        env.pop("DEVICE", None)
+        result = subprocess.run(
+            ["bash", str(self._script()), "--dry-run"], env=env, check=True, capture_output=True, text=True
+        )
+        command = shlex.split(result.stdout.splitlines()[1])
+        assert command[command.index("--device") + 1] == "cuda"
+        pytest.importorskip("hyper_parallel")
+        from tasks import train_muon_step
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "train_muon_step.py",
+                "--smoke",
+                "--output",
+                str(tmp_path),
+                "--case",
+                "unit",
+                "--scenario",
+                "fsdp",
+                "--momentum",
+                "legacy",
+                "--dedup",
+                "1",
+                "--overlap",
+                "0",
+            ],
+        )
+        assert train_muon_step._arguments().device == "cuda"
+        text = Path(train_muon_step.__file__).read_text()
+        assert "torch_npu" not in text and "hccl" not in text and "ProfilerActivity.NPU" not in text
+
+    def test_cuda_profiler_uses_torch_profiler_and_chrome_export(self, tmp_path, monkeypatch):
+        pytest.importorskip("hyper_parallel")
+        from tasks import train_muon_step
+
+        monkeypatch.setattr(train_muon_step.dist, "get_world_size", lambda: 1)
+        monkeypatch.setattr(train_muon_step.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(train_muon_step.dist, "barrier", lambda: None)
+        profile = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = profile
+        factory = MagicMock(return_value=context)
+        monkeypatch.setattr(torch.profiler, "profile", factory)
+        args = SimpleNamespace(
+            profile_steps=2,
+            profile_warmup=1,
+            profile_ranks="all",
+            output=tmp_path,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        runtime = SimpleNamespace(kind="cuda", synchronize=MagicMock())
+        optimizer = SimpleNamespace(step=MagicMock())
+        result = train_muon_step._profile(optimizer, runtime, args)
+        options = factory.call_args.kwargs
+        assert options["activities"] == [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        assert optimizer.step.call_count == 3 and profile.step.call_count == 3
+        options["on_trace_ready"](profile)
+        profile.export_chrome_trace.assert_called_once_with(str(tmp_path / "profiles/rank00000/trace.json"))
+        assert result["active_steps"] == 2
 
     def test_invalid_switch_fails_before_launch(self, tmp_path):
         result = subprocess.run(

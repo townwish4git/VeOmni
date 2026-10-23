@@ -110,29 +110,19 @@ def summarize(directory: Path) -> None:
 def environment_snapshot(args: argparse.Namespace, directory: Path) -> None:
     """Record analysis context without importing any accelerator framework."""
     packages = {}
-    for name in ("torch", "torch-npu", "transformers", "numpy", "veomni", "hyper-parallel", "triton"):
+    for name in ("torch", "transformers", "numpy", "veomni", "hyper-parallel", "triton"):
         try:
             packages[name] = version(name)
         except PackageNotFoundError:
             packages[name] = None
     keys = (
-        "ASCEND_RT_VISIBLE_DEVICES",
         "CUDA_VISIBLE_DEVICES",
         "OMP_NUM_THREADS",
-        "ASCEND_HOME_PATH",
-        "ASCEND_OPP_PATH",
-        "HCCL_IF_BASE_PORT",
-        "HCCL_CONNECT_TIMEOUT",
-        "HCCL_EXEC_TIMEOUT",
-        "HCCL_SOCKET_IFNAME",
-        "HCCL_OP_EXPANSION_MODE",
         "NCCL_SOCKET_IFNAME",
         "NCCL_IB_HCA",
         "NCCL_ALGO",
-        "PYTORCH_NPU_ALLOC_CONF",
         "PYTORCH_CUDA_ALLOC_CONF",
         "CUDA_LAUNCH_BLOCKING",
-        "ASCEND_LAUNCH_BLOCKING",
     )
     result = {
         "hostname": socket.gethostname(),
@@ -143,7 +133,7 @@ def environment_snapshot(args: argparse.Namespace, directory: Path) -> None:
         "environment": {key: os.environ.get(key) for key in keys},
     }
     if args.device != "cpu":
-        command = ["npu-smi", "info"] if args.device == "npu" else ["nvidia-smi"]
+        command = ["nvidia-smi"]
         try:
             probe = subprocess.run(command, capture_output=True, text=True, timeout=15, check=False)
             result["device_probe"] = {
@@ -154,9 +144,6 @@ def environment_snapshot(args: argparse.Namespace, directory: Path) -> None:
             }
         except (OSError, subprocess.TimeoutExpired) as error:
             result["device_probe"] = {"command": command, "error": str(error)}
-    cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")) / "version.cfg"
-    if args.device == "npu" and cann.is_file():
-        result["cann_version_cfg"] = cann.read_text()
     (directory / f"environment-node{args.node_rank}.json").write_text(json.dumps(result, indent=2) + "\n")
 
 
